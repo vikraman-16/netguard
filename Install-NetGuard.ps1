@@ -37,6 +37,13 @@ param(
 $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
 
+function Invoke-Native([string]$exe, [string[]]$argv) {
+    # Windows PowerShell 5.1 turns ANY stderr line of a program into a terminating error when
+    # $ErrorActionPreference is 'Stop' (even with 2>$null). Run it with 'Continue' and use the exit code.
+    $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try { $out = & $exe @argv 2>&1 | ForEach-Object { "$_" } | Out-String; return @{ code = $LASTEXITCODE; out = $out } }
+    finally { $ErrorActionPreference = $old }
+}
 function Get-Tailscale {
     $c = (Get-Command tailscale.exe -ErrorAction SilentlyContinue).Source
     if (-not $c -and (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe")) { $c = "$env:ProgramFiles\Tailscale\tailscale.exe" }
@@ -68,8 +75,8 @@ function Enable-RemoteAccess([int]$port) {
     $name = "$($st.Self.DNSName)".TrimEnd('.')
     $ans = Read-Host "  Make the dashboard available to your Tailscale devices at https://$name ? [Y/n]"
     if ($ans -match '^[Nn]') { return $null }
-    $out = & $ts serve --bg --https=443 "http://127.0.0.1:$port" 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0) {
+    $r = Invoke-Native $ts @('serve', '--bg', '--https=443', "http://127.0.0.1:$port"); $out = $r.out
+    if ($r.code -ne 0) {
         Write-Warning "tailscale serve failed:`n$out"
         Write-Host '  In the Tailscale admin console (DNS page) turn on MagicDNS and HTTPS Certificates, then run Setup.cmd again.'
         return $null
@@ -103,8 +110,8 @@ try {
         Write-Host ''
         if ($ResetPassword) {
             $py = Get-DashPython
-            $out = & $py "$env:ProgramFiles\NetGuard\dashboard\server.py" --config $cfgPath --reset-user $User 2>&1 | Out-String
-            if ($LASTEXITCODE -ne 0) { throw "reset failed: $out" }
+            $r = Invoke-Native $py @("$env:ProgramFiles\NetGuard\dashboard\server.py", '--config', $cfgPath, '--reset-user', $User); $out = $r.out
+            if ($r.code -ne 0) { throw "reset failed: $out" }
             $pw = ([regex]::Match($out, 'One-time password: (\S+)')).Groups[1].Value
             try { Set-Clipboard -Value $pw } catch { }
             Write-Host "  Account '$User' reset." -ForegroundColor Green
@@ -182,7 +189,7 @@ try {
     $seen = $false
     foreach ($i in 1..24) {   # up to ~2 minutes (first cycle also runs the hardening audit)
         Start-Sleep -Seconds 5
-        $r = & $py -c $check $cfg.db_path $env:COMPUTERNAME 2>$null
+        $r = (Invoke-Native $py @('-c', $check, $cfg.db_path, $env:COMPUTERNAME)).out
         if ("$r".Trim() -eq 'yes') { $seen = $true; break }
         Write-Host '.' -NoNewline
     }

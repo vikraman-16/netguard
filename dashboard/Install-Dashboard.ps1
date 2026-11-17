@@ -40,6 +40,13 @@ if ($Uninstall) {
     return
 }
 
+function Invoke-Native([string]$exe, [string[]]$argv) {
+    # Windows PowerShell 5.1 turns ANY stderr line of a program into a terminating error when
+    # $ErrorActionPreference is 'Stop' (even with 2>$null). Run it with 'Continue' and use the exit code.
+    $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try { $out = & $exe @argv 2>&1 | ForEach-Object { "$_" } | Out-String; return @{ code = $LASTEXITCODE; out = $out } }
+    finally { $ErrorActionPreference = $old }
+}
 # Python must be a machine-wide install: SYSTEM can't use per-user Python or the Store stub.
 $python = $null
 foreach ($c in @(Get-Command python.exe, py.exe -All -ErrorAction SilentlyContinue)) {
@@ -52,12 +59,13 @@ if ([version]$ver -lt [version]'3.8') { throw "Python $ver is too old (need 3.8+
 # The dashboard encrypts stored secrets and signs agent commands with the 'cryptography' package.
 # It runs as SYSTEM, which can't see per-user packages, so check and install with -s (no user site-packages)
 # to get exactly SYSTEM's view, and install machine-wide.
-& $python -s -c "import cryptography" 2>$null
-if ($LASTEXITCODE -ne 0) {
+if ((Invoke-Native $python @('-s', '-c', 'import cryptography')).code -ne 0) {
     Write-Host 'Installing the Python "cryptography" package for all users (needs internet)...'
-    & $python -s -m pip install --disable-pip-version-check --quiet cryptography
-    & $python -s -c "import cryptography" 2>$null
-    if ($LASTEXITCODE -ne 0) { throw 'Could not install the Python "cryptography" package for all users. Check the internet connection, or run from an elevated prompt: python -s -m pip install cryptography' }
+    $pip = Invoke-Native $python @('-s', '-m', 'pip', 'install', '--disable-pip-version-check', '--quiet', 'cryptography')
+    if ((Invoke-Native $python @('-s', '-c', 'import cryptography')).code -ne 0) {
+        throw "Could not install the Python 'cryptography' package for all users. Check the internet connection, or run from an elevated prompt: python -s -m pip install cryptography`n$($pip.out.Trim())"
+    }
+    Write-Host '  installed.'
 }
 
 # ---- files -------------------------------------------------------------------
