@@ -155,7 +155,14 @@ class Backups:
         for j in self.db.q("SELECT * FROM backup_jobs WHERE %s ORDER BY host, name" % f, fa):
             spec = json.loads(j["spec"])
             last = self.last_runs(j["id"])
-            jobs.append({"id": j["id"], "host": j["host"], "name": j["name"], "enabled": bool(j["enabled"]), "spec": spec,
+            labels = []
+            for d in spec["destinations"]:
+                if d["type"] == "local":
+                    labels.append(d["path"])
+                else:
+                    it = self.db.one("SELECT name FROM vault_items WHERE id=?", (d["vault_id"],))
+                    labels.append("S3: %s" % (it["name"] if it else "missing vault item #%d" % d["vault_id"]))
+            jobs.append({"id": j["id"], "host": j["host"], "name": j["name"], "enabled": bool(j["enabled"]), "spec": spec, "dest_labels": labels,
                          "recovery_item": j["recovery_item"], "created_by": j["created_by"], "updated_at": j["updated_at"],
                          "last": last, "health": self.health(j, spec, last)})
         return jobs

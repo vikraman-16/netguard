@@ -16,15 +16,17 @@ These scripts harden and monitor Linux and Windows servers. A web dashboard show
 
 Agents only make outbound HTTPS calls. The dashboard never connects to your servers. Remediation runs **only** after you click it in the dashboard. It runs at the agent's next check-in (60 s or less), and the agent validates every command again before running it.
 
-There is nothing to install with pip: everything uses the Python 3.6+ standard library, or PowerShell 5.1+.
+The agents need nothing extra: the Python 3.6+ standard library on Linux (plus the `openssl` command for encrypted backups), and PowerShell 5.1+ on Windows. The dashboard needs Python 3.8+ and the `cryptography` package, which setup installs.
 
 | Folder | What's in it |
 |---|---|
-| `dashboard/` | `server.py` (API, SQLite, auth) and `static/` (the UI) |
+| `dashboard/` | `server.py` (API, SQLite) with `auth.py` (accounts, 2FA), `secure.py` (encryption, command signing), `notify.py`, `vault.py`, `backups.py` and `risk.py`, plus `static/` (the UI) |
+| `tools/ng-decrypt.py` | decrypts a backup archive **without NetGuard**, for disaster recovery |
+| `tests/` | `python tests/run_tests.py` runs everything, including real agents and WSL when available |
 | `hardening/linux/harden.sh` | 49 checks: SSH, firewall, fail2ban, automatic updates, auditd, sysctl, permissions, accounts, sudo, services |
 | `hardening/windows/Harden-Server.ps1` | 24 checks: firewall, SMBv1 and signing, RDP NLA, LLMNR, WDigest, LSA, NTLMv1, audit policy, Defender, TLS, PowerShell logging and more |
-| `agents/linux/` | `netguard_agent.py` and `install.sh` (installs a systemd service) |
-| `agents/windows/` | `NetGuard-Agent.ps1` and `Install-Agent.ps1` (installs a scheduled task that runs as SYSTEM every minute) |
+| `agents/linux/` | `netguard_agent.py`, `netguard_backup.py` (backup runner) and `install.sh` (installs a systemd service) |
+| `agents/windows/` | `NetGuard-Agent.ps1`, `NetGuard-Backup.ps1` (backup runner) and `Install-Agent.ps1` (installs a scheduled task that runs as SYSTEM every minute) |
 
 ---
 
@@ -277,6 +279,59 @@ Safety built in:
 * `--json` / `-Json` writes a machine-readable report. The agents use this.
 
 **Review these checks before applying them:** `ssh_password_auth`, `legacy_tls_disabled` (old clients), `smb_signing` (very old clients), `ntlmv1_disabled` (legacy apps), `print_spooler_disabled` (print servers) and `optional_services` (rpcbind, if you use NFS). `lsa_protection`, `uac_enabled` and `legacy_tls_disabled` need a reboot.
+
+## 5. Notifications
+
+Owners set these up in **Settings → Notifications**. Supported channels: email (SMTP), Telegram bot, Discord webhook, Microsoft Teams (Workflows webhook) and a generic JSON webhook.
+
+* Each channel has a minimum severity (default: high and above) and an optional **daily summary**: open alerts, servers online, backup problems, risk-register totals and the alerts that need attention.
+* New alerts are sent right away, with a link that opens the alert. A repeat of the same alert doesn't re-notify. Each channel is limited to 20 messages per hour, after which you get one "too many alerts" notice.
+* Passwords, bot tokens and webhook URLs are stored encrypted and never shown back. Use **Send test** to check a channel.
+
+## 6. How NetGuard protects itself
+
+* **Per-server agent keys.** A server uses the shared *join token* only once. It then gets its own key, and from that moment the join token is no longer accepted for that server. Owners can stop new servers from joining, rotate the join token, reset a server's key (after reinstalling an agent) or remove a server.
+* **Signed commands.** The dashboard signs every command and every backup-job bundle with an ECDSA P-256 key (`command-signing.pem` in the data folder). Agents pin the public key, from the installer (`-CommandKey` / `--command-key`) or on first contact. They refuse:
+  * unsigned or forged commands
+  * commands meant for another server
+  * expired commands (15 minutes; check clocks)
+  * replayed commands
+
+  Verification uses Windows CNG on Windows and a small standard-library P-256 verifier on Linux.
+* **Encryption at rest.** Vault items, notification secrets and backup keys are sealed with AES-256-GCM using `netguard.key` (data folder, admins only).
+* **Database backups.** The dashboard copies its database daily to `db-backups\` (last 14 kept). **Keep an offline copy of `netguard.key`**: without it, the saved secrets can't be decrypted.
+
+## 7. Vault
+
+The **Vault** tab, for admins and owners, holds logins, database credentials, S3-compatible storage keys, API keys, recovery keys and notes.
+
+* Everything secret is encrypted. Listings show only non-secret fields.
+* **Showing a secret requires a fresh 2-factor code**, which is then valid for 10 minutes. Every view, change and share is logged.
+* Owners can use every item. Admins can use only the items they created or that were shared with them. Viewers have no access to the vault.
+
+## 8. Backups
+
+The **Backups** tab defines jobs per server:
+
+* **What:** website files and web-server config (IIS, XAMPP/WAMP, nginx, Apache, Let's Encrypt), databases, chosen folders (with exclusions) and a server configuration snapshot.
+  * Databases: MySQL/MariaDB (`mysqldump --single-transaction`), PostgreSQL (`pg_dump`/`pg_dumpall`), SQL Server (`BACKUP DATABASE … COPY_ONLY`, Windows) and SQLite.
+  * Configuration snapshot, Windows: firewall export, scheduled tasks, services, programs, network, users and shares.
+  * Configuration snapshot, Linux: `/etc`, crontabs, packages, firewall rules, network, users and docker.
+* **Where:** local, USB or network folders and/or S3-compatible storage (AWS S3, Backblaze B2, Wasabi, Cloudflare R2, MinIO). Requests use AWS Signature V4, checked against the AWS documentation example. Use both for 3-2-1.
+* **When and how long:** daily at a time, or every N hours. Keep the last N archives **and** anything newer than D days. You set an RPO for each job.
+* **Encryption:** every archive is encrypted (format **NGBK1**: AES-256-CBC + HMAC-SHA256, the same on Windows and Linux). Each job has its own **recovery key**. It's shown once at creation, saved in the Vault, and **should also be stored offline**.
+  * To decrypt without NetGuard: `python tools/ng-decrypt.py ARCHIVE.ngbk out.zip --key <recovery key>`. The tool verifies integrity before writing anything.
+* **Test restores:** automatic every N days, or on demand. A test downloads, checksums, decrypts and opens the archive, and checks the database dumps. **Restore…** extracts into a new, empty folder and never overwrites anything.
+* **Alerts:** backup failed, never succeeded, older than its RPO, test restore failed, or not tested recently. These flow into notifications and the risk register. Jobs run in a separate process, so monitoring continues during long backups.
+
+Limits: one archive per run with a single S3 upload of up to 5 GB, so split very large data into several jobs. On Windows, SQLite is copied as a file. SQL Server backups need the database service account to be able to write to `C:\ProgramData\NetGuard\sqlstage`; the runner grants this.
+
+## 9. Risk register and disaster recovery
+
+* **Risk tab.** Risks are scored likelihood × impact (1–25) and shown on a heat map.
+  * **Automatic risks**, which disappear once fixed: critical or high alerts left open, an offline agent, a weak hardening score, no backups, failed, stale or untested backups, no DR plan, a backup schedule that can't meet the RPO, measured restore time over the RTO, nobody notified, a single owner, a dashboard database not backed up, and recovery keys not confirmed stored offline.
+  * Add your own risks with an owner, treatment, due date and status. Owners can accept an automatic risk, which needs a reason and an expiry.
+* **DR plans tab.** Each server has a tier (1–3), RPO, RTO, owner, contacts and dependencies. A live status shows whether the RPO is met (newest good backup age) and whether the RTO is met (measured test-restore time). It also includes a **recovery runbook** generated from what is actually backed up: how to rebuild, reconnect, restore files, configuration, databases (with the exact commands per engine) and websites, then verify. **Print it** and keep it with the offline keys.
 
 ## Notes and limits
 

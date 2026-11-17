@@ -1075,7 +1075,7 @@ async function loadBackups() {
   $("#bk-table tbody").innerHTML = data.jobs.map((j) => {
     const s = j.spec, src = s.sources;
     const what = [src.website && "website", src.config && "server config", src.folders.length && src.folders.length + " folder(s)", src.databases.length && src.databases.length + " database(s)"].filter(Boolean).join(", ");
-    const where = s.destinations.map((d) => (d.type === "local" ? esc(d.path) : "S3 (vault #" + d.vault_id + ")")).join("<br>");
+    const where = (j.dest_labels || []).map(esc).join("<br>");
     const sched = s.schedule.mode === "daily" ? `daily ${s.schedule.at}` : `every ${s.schedule.every} h`;
     return `<tr>
       <td><b>${esc(j.name)}</b><div class="muted small">${esc(j.host)}${j.enabled ? "" : " · disabled"}</div>
@@ -1204,6 +1204,158 @@ $("#bk-table").addEventListener("click", async (e) => {
 });
 
 // ---------------------------------------------------------------------------
+// Risk register
+// ---------------------------------------------------------------------------
+function scoreBadge(s) { const l = s >= 20 ? "critical" : s >= 12 ? "high" : s >= 6 ? "medium" : "low"; return `<span class="score ${l}">${s}</span>`; }
+async function loadRisk() {
+  const r = await api("/api/risks");
+  state.risk = r;
+  $("#badge-risk").textContent = r.summary.critical || "";
+  $("#rk-new").hidden = !canAct();
+  $("#rk-summary").innerHTML = `<div class="tile"><div class="n">${r.summary.open}</div><div class="l">open risks</div></div>
+    <div class="tile sev-critical"><div class="n">${r.summary.critical}</div><div class="l">critical (20+)</div></div>
+    <div class="tile sev-high"><div class="n">${r.summary.high}</div><div class="l">high (12–19)</div></div>`;
+  $("#rk-keys").innerHTML = isOwner() ? (r.keys_offline_confirmed
+    ? '<p class="small muted">✔ Recovery keys confirmed stored offline. <button class="btn small" data-keys="0">Undo</button></p>'
+    : '<p class="small"><button class="btn small primary" data-keys="1">I have stored netguard.key and all backup recovery keys offline</button></p>') : "";
+  // heat map: rows likelihood 5..1, columns impact 1..5
+  let h = "";
+  for (let lk = 5; lk >= 1; lk--) {
+    h += `<tr><th>${lk}</th>`;
+    for (let im = 1; im <= 5; im++) {
+      const n = r.heat[lk - 1][im - 1], s = lk * im, l = s >= 20 ? "critical" : s >= 12 ? "high" : s >= 6 ? "medium" : "low";
+      h += `<td class="heat-${l}" title="likelihood ${lk} × impact ${im} = ${s}">${n || ""}</td>`;
+    }
+    h += "</tr>";
+  }
+  $("#rk-heat").innerHTML = h + '<tr><th></th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th></tr>';
+  $("#rk-auto tbody").innerHTML = r.auto.map((x) => `<tr class="${x.accepted ? "muted-row" : ""}">
+    <td>${scoreBadge(x.score)}<div class="muted small">L${x.likelihood}×I${x.impact}</div></td>
+    <td><b>${esc(x.title)}</b><div class="muted small">${esc(x.category)}</div>
+      ${x.accepted ? `<div class="small">accepted by ${esc(x.accepted.accepted_by)}${x.accepted.until ? " until " + esc(fmtTime(x.accepted.until)) : ""}: <i>${esc(x.accepted.reason)}</i></div>` : ""}</td>
+    <td>${esc(x.host || "all")}</td><td class="small">${esc(x.detail)}</td><td class="small">${esc(x.suggestion)}</td>
+    <td>${isOwner() ? (x.accepted ? `<button class="btn small" data-unaccept="${esc(x.key)}">Un-accept</button>` : `<button class="btn small" data-accept="${esc(x.key)}">Accept…</button>`) : ""}</td></tr>`).join("")
+    || '<tr><td colspan="6" class="empty">No automatic risks right now. 🎉</td></tr>';
+  $("#rk-manual tbody").innerHTML = r.manual.map((x) => `<tr class="${x.status === "closed" ? "muted-row" : ""}">
+    <td>${scoreBadge(x.score)}</td><td><b>${esc(x.title)}</b>${x.notes ? `<div class="muted small">${esc(x.notes.slice(0, 140))}</div>` : ""}</td>
+    <td>${esc(x.host || "all")}</td><td>${esc(x.category)}</td><td>${esc(x.owner)}</td><td>${esc(x.treatment)}</td>
+    <td>${esc(x.due)}${x.overdue ? ' <span class="status failed">overdue</span>' : ""}</td><td>${esc(x.status.replace("_", " "))}</td>
+    <td>${canAct() ? `<button class="btn small" data-rkedit="${x.id}">Edit</button> <button class="btn small" data-rkdel="${x.id}">Delete</button>` : ""}</td></tr>`).join("")
+    || '<tr><td colspan="9" class="empty">No manual risks. Add things NetGuard can\'t see: single supplier, expiring certificates, no UPS, one person knows the passwords…</td></tr>';
+}
+function riskForm(x) {
+  const r = state.risk, v = x || { likelihood: 3, impact: 3, category: "operations", treatment: "mitigate", status: "open" };
+  const opt = (arr, cur) => arr.map((a) => `<option ${a === cur ? "selected" : ""}>${a}</option>`).join("");
+  const n15 = (cur) => [1, 2, 3, 4, 5].map((n) => `<option ${n === cur ? "selected" : ""}>${n}</option>`).join("");
+  return `<label class="note">Risk<input id="rf-title" class="field" value="${esc(v.title || "")}" placeholder="e.g. Only one admin knows the firewall password"></label>
+    <div class="set-row"><label>Server <select id="rf-host" class="field"><option value="">all / none</option>${state.hosts.map((h) => `<option ${h.name === v.host ? "selected" : ""}>${esc(h.name)}</option>`).join("")}</select></label>
+      <label>Category <select id="rf-cat" class="field">${opt(r.categories, v.category)}</select></label></div>
+    <div class="set-row"><label>Likelihood (1 rare – 5 almost certain) <select id="rf-l" class="field">${n15(v.likelihood)}</select></label>
+      <label>Impact (1 minor – 5 severe) <select id="rf-i" class="field">${n15(v.impact)}</select></label></div>
+    <div class="set-row"><label>Owner <input id="rf-owner" class="field" value="${esc(v.owner || "")}"></label>
+      <label>Treatment <select id="rf-tr" class="field">${opt(r.treatments, v.treatment)}</select></label></div>
+    <div class="set-row"><label>Due <input id="rf-due" class="field" type="date" value="${esc(v.due || "")}"></label>
+      <label>Status <select id="rf-st" class="field">${opt(["open", "in_progress", "closed"], v.status)}</select></label></div>
+    <label class="note">Notes / plan<textarea id="rf-notes" class="field" rows="2">${esc(v.notes || "")}</textarea></label>`;
+}
+function readRiskForm() {
+  return { title: $("#rf-title").value, host: $("#rf-host").value, category: $("#rf-cat").value, likelihood: +$("#rf-l").value,
+    impact: +$("#rf-i").value, owner: $("#rf-owner").value, treatment: $("#rf-tr").value, due: $("#rf-due").value,
+    status: $("#rf-st").value, notes: $("#rf-notes").value };
+}
+$("#rk-new").addEventListener("click", async () => {
+  if (!(await confirmBox("Add a risk", "", riskForm(null)))) return;
+  try { await api("/api/risks", readRiskForm()); toast("Added"); } catch (e) { toast(e.message, true); }
+  loadRisk();
+});
+$("#tab-risk").addEventListener("click", async (e) => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  try {
+    if (b.dataset.keys !== undefined) {
+      if (b.dataset.keys === "1" && !(await confirmBox("Confirm offline keys", "Only confirm if netguard.key (dashboard data folder) and every backup recovery key are stored somewhere that survives losing this PC: printed in a safe, a password manager, an encrypted USB stick in another building."))) return;
+      await api("/api/risks/keys-confirmed", { confirmed: b.dataset.keys === "1" });
+    } else if (b.dataset.accept) {
+      const x = state.risk.auto.find((r) => r.key === b.dataset.accept);
+      const res = await confirmBox(`Accept: ${x.title}`, "The risk stays listed (greyed out) but is no longer counted. Write down why it's acceptable.",
+        '<label class="note">For<select id="ra-days" class="field"><option value="30">30 days</option><option value="90" selected>90 days</option><option value="365">1 year</option><option value="">until removed</option></select></label>');
+      if (!res) return;
+      await api("/api/risks/accept", { key: x.key, reason: res.note, days: $("#ra-days").value || null });
+    } else if (b.dataset.unaccept) {
+      await api("/api/risks/unaccept", { key: b.dataset.unaccept });
+    } else if (b.dataset.rkedit) {
+      const x = state.risk.manual.find((r) => r.id === +b.dataset.rkedit);
+      if (!(await confirmBox("Edit risk", "", riskForm(x)))) return;
+      await api(`/api/risks/${x.id}/update`, readRiskForm());
+    } else if (b.dataset.rkdel) {
+      if (!(await confirmBox("Delete this risk?", "Closing it (status: closed) keeps the history; deleting removes it."))) return;
+      await api(`/api/risks/${b.dataset.rkdel}/delete`, {});
+    } else return;
+    toast("Saved");
+  } catch (err) { toast(err.message, true); }
+  loadRisk();
+});
+
+// ---------------------------------------------------------------------------
+// DR plans + runbooks
+// ---------------------------------------------------------------------------
+function metBadge(v, label) { return v === true ? `<span class="status resolved">${label} met</span>` : v === false ? `<span class="status failed">${label} NOT met</span>` : `<span class="status">${label} unknown</span>`; }
+async function loadDr() {
+  const d = await api("/api/dr");
+  state.dr = d;
+  $("#dr-list").innerHTML = d.plans.map((x) => {
+    const p = x.plan, s = x.status;
+    return `<div class="set-card dr-card" data-host="${esc(x.host)}">
+      <div class="people-head"><div><b>${esc(x.host)}</b> <span class="muted small">${esc(x.os || "")} · ${esc(x.ip || "")}</span>
+        ${p ? `<span class="status">${esc({ 1: "Tier 1 · critical", 2: "Tier 2 · important", 3: "Tier 3 · normal" }[p.tier])}</span>` : '<span class="status open">no plan</span>'}</div>
+        <div>${canAct() ? `<button class="btn small" data-dredit="${esc(x.host)}">${p ? "Edit plan" : "Create plan"}</button>` : ""}
+          <button class="btn small" data-drprint="${esc(x.host)}">Print runbook</button></div></div>
+      <div class="dr-status">
+        ${p ? `<div><b>RPO</b> ${p.rpo_hours} h · last good backup ${s.last_good_backup_age_h != null ? s.last_good_backup_age_h + " h ago" : "none"} ${metBadge(s.rpo_met, "RPO")}</div>
+        <div><b>RTO</b> ${p.rto_hours} h · measured restore ${s.measured_restore_min != null ? s.measured_restore_min + " min" : "not tested"} ${metBadge(s.rto_met, "RTO")}</div>
+        <div class="small muted">Owner: ${esc(p.owner || "–")} · Contacts: ${esc(p.contacts || "–")}</div>` :
+        '<div class="small">Set the recovery objectives so NetGuard can tell you whether backups and restore speed are good enough.</div>'}
+        <div class="small muted">${s.jobs} backup job(s)${s.last_test_age_d != null ? " · last full test restore " + s.last_test_age_d + " days ago" : ""}</div>
+      </div>
+      <details><summary class="small">Recovery runbook (${x.runbook.length} steps)</summary>
+        <ol class="runbook">${x.runbook.map((st) => `<li><b>${esc(st.title)}</b><div class="small" style="white-space:pre-wrap">${esc(st.text)}</div></li>`).join("")}</ol></details>
+    </div>`;
+  }).join("") || '<div class="empty">No servers yet.</div>';
+}
+$("#dr-list").addEventListener("click", async (e) => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  const host = b.dataset.dredit || b.dataset.drprint;
+  const x = state.dr.plans.find((p) => p.host === host);
+  if (b.dataset.drprint) {
+    const card = b.closest(".dr-card");
+    card.querySelector("details").open = true;
+    document.body.classList.add("print-runbook");
+    card.classList.add("printing");
+    window.print();
+    card.classList.remove("printing");
+    document.body.classList.remove("print-runbook");
+    return;
+  }
+  const p = x.plan || { tier: 2, rpo_hours: 24, rto_hours: 8 };
+  const res = await confirmBox(`DR plan: ${host}`, "RPO = the most data (hours) you can afford to lose. RTO = how quickly the server must be working again.",
+    `<div class="set-row"><label>Tier <select id="dp-tier" class="field">${[[1, "1 · critical"], [2, "2 · important"], [3, "3 · normal"]].map(([v, l]) => `<option value="${v}" ${p.tier === v ? "selected" : ""}>${l}</option>`).join("")}</select></label>
+      <label>RPO <input id="dp-rpo" class="field" type="number" min="1" style="width:70px" value="${p.rpo_hours}"> h</label>
+      <label>RTO <input id="dp-rto" class="field" type="number" min="1" style="width:70px" value="${p.rto_hours}"> h</label></div>
+     <label class="note">Owner<input id="dp-owner" class="field" value="${esc(p.owner || "")}"></label>
+     <label class="note">Contacts (names, phones, provider support numbers)<textarea id="dp-contacts" class="field" rows="2">${esc(p.contacts || "")}</textarea></label>
+     <label class="note">Depends on (DNS, domain registrar, database server, licences…)<textarea id="dp-deps" class="field" rows="2">${esc(p.dependencies || "")}</textarea></label>
+     <label class="note">Notes<textarea id="dp-notes" class="field" rows="2">${esc(p.notes || "")}</textarea></label>`);
+  if (!res) return;
+  try {
+    await api(`/api/dr/${encodeURIComponent(host)}`, { tier: +$("#dp-tier").value, rpo_hours: +$("#dp-rpo").value, rto_hours: +$("#dp-rto").value,
+      owner: $("#dp-owner").value, contacts: $("#dp-contacts").value, dependencies: $("#dp-deps").value, notes: $("#dp-notes").value });
+    toast("Plan saved");
+  } catch (err) { toast(err.message, true); }
+  loadDr();
+});
+
+// ---------------------------------------------------------------------------
 async function refresh() {
   try {
     await loadSummary();
@@ -1216,6 +1368,8 @@ async function refresh() {
     if (state.tab === "settings") await loadSettings();
     if (state.tab === "backups") await loadBackups();
     if (state.tab === "vault") await loadVault();
+    if (state.tab === "risk") await loadRisk();
+    if (state.tab === "dr") await loadDr();
   } catch (e) { toast("Refresh failed: " + e.message, true); }
 }
 setInterval(() => {

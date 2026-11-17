@@ -34,8 +34,9 @@ from notify import Notifier  # noqa: E402
 from secure import KeyStore  # noqa: E402
 from vault import Vault, VaultError  # noqa: E402
 from backups import Backups, BackupError  # noqa: E402
+from risk import RiskManager  # noqa: E402
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 SESSION_COOKIE = "ng_session"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -317,8 +318,18 @@ class NetGuard:
         self.notifier = Notifier(self)
         self.vault = Vault(self)
         self.backups = Backups(self)
+        self.risk = RiskManager(self)
         self.ingest_extra = self.backups.agent_extra
-        self.digest_extra = self.backups.digest_lines
+        self.digest_extra = self._digest_extra
+
+    def _digest_extra(self):
+        lines = self.backups.digest_lines()
+        try:
+            r = self.risk.register(None)["summary"]
+            lines.append("Risk register: %d open risk(s), %d critical, %d high" % (r["open"], r["critical"], r["high"]))
+        except Exception as e:
+            lines.append("Risk register: unavailable (%s)" % e)
+        return lines
 
     # ---- settings (key/value, JSON) ----------------------------------------
     def get_setting(self, key, default=None):
@@ -991,6 +1002,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not AuthManager.can(user, "admin"):
                     return self._send(403, {"error": "The vault is for admins and owners."})
                 return self._send(200, self.app.vault.log(user))
+            if path == "/api/risks":
+                return self._send(200, self.app.risk.register(scope))
+            if path == "/api/dr":
+                return self._send(200, {"plans": self.app.risk.plans(scope), "tiers": {1: "critical", 2: "important", 3: "normal"}})
             if path == "/api/backups":
                 return self._send(200, {"jobs": self.app.backups.list(scope), "hosts": [h["name"] for h in self.app.hosts(scope)]})
             m = re.match(r"^/api/backups/(\d+)/runs$", path)
@@ -1133,6 +1148,34 @@ class Handler(BaseHTTPRequestHandler):
                 if op == "share":
                     return self._send(200, {"access": self.app.vault.share(user, iid, body.get("users") or [], ip)})
                 self.app.vault.delete(user, iid, ip)
+                return self._send(200, {"ok": True})
+
+            # ---- risk register / DR plans ----
+            if path == "/api/risks":
+                return self._send(200, {"id": self.app.risk.save(name, body)})
+            m = re.match(r"^/api/risks/(\d+)/(update|delete)$", path)
+            if m:
+                rid = int(m.group(1))
+                if m.group(2) == "delete":
+                    self.app.risk.delete(name, rid)
+                    return self._send(200, {"ok": True})
+                return self._send(200, {"id": self.app.risk.save(name, body, rid)})
+            if path in ("/api/risks/accept", "/api/risks/unaccept", "/api/risks/keys-confirmed"):
+                if not is_owner:
+                    return self._send(403, {"error": "Only owners can accept risks."})
+                if path == "/api/risks/accept":
+                    self.app.risk.accept(name, str(body.get("key") or ""), str(body.get("reason") or ""), body.get("days"))
+                elif path == "/api/risks/unaccept":
+                    self.app.risk.unaccept(name, str(body.get("key") or ""))
+                else:
+                    self.app.set_setting("keys_offline_confirmed", bool(body.get("confirmed", True)))
+                    self.app.db.audit(name, "keys_offline_confirmed", str(bool(body.get("confirmed", True))))
+                return self._send(200, {"ok": True})
+            m = re.match(r"^/api/dr/([A-Za-z0-9_.\-]+)$", path)
+            if m:
+                if scope is not None and m.group(1) not in scope:
+                    return self._send(404, {"error": "unknown server"})
+                self.app.risk.save_plan(name, m.group(1), body)
                 return self._send(200, {"ok": True})
 
             # ---- backup jobs ----

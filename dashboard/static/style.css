@@ -197,3 +197,32 @@ dl.reveal dd { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 dialog .note b { color: var(--text); }
 dialog .set-row input.field { width: auto; }
 dialog { max-height: 90vh; overflow-y: auto; width: min(560px, 94vw); }
+/* ---- risk / DR ---- */
+.risk-top { display: grid; grid-template-columns: 1fr auto; gap: 18px; align-items: start; }
+.rk-summary { display: flex; gap: 10px; margin: 8px 0; }
+.rk-summary .tile { min-width: 110px; }
+.heat { border-collapse: separate; border-spacing: 3px; }
+.heat th { font-size: 11px; color: var(--muted); font-weight: 600; width: 18px; }
+.heat td { width: 38px; height: 30px; text-align: center; font-weight: 700; border-radius: 5px; color: #111; }
+.heat-low { background: color-mix(in srgb, var(--ok) 35%, transparent); }
+.heat-medium { background: color-mix(in srgb, var(--medium) 45%, transparent); }
+.heat-high { background: color-mix(in srgb, var(--high) 55%, transparent); }
+.heat-critical { background: color-mix(in srgb, var(--critical) 65%, transparent); color: #fff; }
+.score { display: inline-block; min-width: 30px; text-align: center; font-weight: 800; border-radius: 6px; padding: 2px 6px; font-size: 13px; }
+.score.low { background: color-mix(in srgb, var(--ok) 25%, transparent); }
+.score.medium { background: color-mix(in srgb, var(--medium) 35%, transparent); }
+.score.high { background: color-mix(in srgb, var(--high) 40%, transparent); }
+.score.critical { background: var(--critical); color: #fff; }
+.muted-row td { opacity: .55; }
+.dr-list { display: grid; gap: 12px; }
+.dr-status { display: grid; gap: 4px; margin: 6px 0 8px; font-size: 13px; }
+ol.runbook { padding-left: 20px; }
+ol.runbook li { margin-bottom: 8px; }
+@media (max-width: 760px) { .risk-top { grid-template-columns: 1fr; } }
+@media print {
+  body.print-runbook .top, body.print-runbook .tiles, body.print-runbook .panel:not(#tab-dr), body.print-runbook .dr-card:not(.printing),
+  body.print-runbook #tab-dr > p, body.print-runbook .dr-card button, body.print-runbook .toast { display: none !important; }
+  body.print-runbook, body.print-runbook .panel, body.print-runbook .set-card { background: #fff !important; color: #000 !important; border: 0 !important; }
+  body.print-runbook #tab-dr { display: block !important; }
+  body.print-runbook summary { display: none; }
+}
