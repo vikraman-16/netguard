@@ -50,12 +50,14 @@ $ver = & $python -c "import sys; print('%d.%d' % sys.version_info[:2])"
 if ([version]$ver -lt [version]'3.8') { throw "Python $ver is too old (need 3.8+)." }
 
 # The dashboard encrypts stored secrets and signs agent commands with the 'cryptography' package.
-& $python -c "import cryptography" 2>$null
+# It runs as SYSTEM, which can't see per-user packages, so check and install with -s (no user site-packages)
+# to get exactly SYSTEM's view, and install machine-wide.
+& $python -s -c "import cryptography" 2>$null
 if ($LASTEXITCODE -ne 0) {
-    Write-Host 'Installing the Python "cryptography" package (needs internet)...'
-    & $python -m pip install --disable-pip-version-check --quiet cryptography
-    & $python -c "import cryptography" 2>$null
-    if ($LASTEXITCODE -ne 0) { throw 'Could not install the Python "cryptography" package. Check the internet connection, or run: python -m pip install cryptography' }
+    Write-Host 'Installing the Python "cryptography" package for all users (needs internet)...'
+    & $python -s -m pip install --disable-pip-version-check --quiet cryptography
+    & $python -s -c "import cryptography" 2>$null
+    if ($LASTEXITCODE -ne 0) { throw 'Could not install the Python "cryptography" package for all users. Check the internet connection, or run from an elevated prompt: python -s -m pip install cryptography' }
 }
 
 # ---- files -------------------------------------------------------------------
@@ -119,7 +121,14 @@ foreach ($i in 1..30) {
     Start-Sleep -Milliseconds 500
     try { Invoke-RestMethod "http://${probe}:$Port/healthz" -TimeoutSec 2 | Out-Null; $ok = $true; break } catch { }
 }
-if (-not $ok) { throw "Dashboard task started but http://${probe}:$Port/healthz is not answering. Check Task Scheduler > '$TaskName' > History, or whether port $Port is in use." }
+if (-not $ok) {
+    # show WHY: start the server the way SYSTEM would (no user packages) for a few seconds and capture its error
+    $diag = Join-Path $env:TEMP 'netguard-dashboard-start.log'
+    $pp = Start-Process $python -ArgumentList "-s `"$InstallDir\server.py`" --config `"$CfgPath`"" -RedirectStandardError $diag -PassThru -WindowStyle Hidden
+    Start-Sleep 4; if (-not $pp.HasExited) { Stop-Process -Id $pp.Id -Force }
+    $why = (Get-Content $diag -ErrorAction SilentlyContinue | Select-Object -Last 6) -join "`n"
+    throw "Dashboard task started but http://${probe}:$Port/healthz is not answering.`n$why"
+}
 
 Write-Host ''
 Write-Host "Dashboard running: http://${probe}:$Port   (starts automatically at boot)" -ForegroundColor Green
