@@ -42,7 +42,7 @@ if ($Uninstall) {
 }
 if (-not $Server -or -not $Token) { throw 'Usage: .\Install-Agent.ps1 -Server URL -Token TOKEN' }
 if ($SafeMode -and $FullControl) { throw 'Use either -SafeMode or -FullControl.' }
-$SafeActions = @('accept_listener', 'allow_process', 'kill_process', 'quarantine_file', 'restore_quarantine', 'run_hardening_audit', 'unblock_ip', 'unblock_port', 'harden_restore')
+$SafeActions = @('accept_listener', 'allow_process', 'kill_process', 'quarantine_file', 'restore_quarantine', 'run_hardening_audit', 'unblock_ip', 'unblock_port', 'harden_restore', 'backup_run', 'backup_test', 'backup_restore')
 
 New-Item -ItemType Directory -Path $Dir -Force | Out-Null
 # Only SYSTEM and Administrators may touch the folder: the task runs these scripts as SYSTEM.
@@ -56,6 +56,7 @@ Set-Acl -Path $Dir -AclObject $acl
 
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 Copy-Item (Join-Path $here 'NetGuard-Agent.ps1') $Dir -Force
+Copy-Item (Join-Path $here 'NetGuard-Backup.ps1') $Dir -Force
 $harden = Join-Path $here '..\..\hardening\windows\Harden-Server.ps1'
 if (Test-Path $harden) { Copy-Item $harden $Dir -Force } else { Write-Warning 'Harden-Server.ps1 not found next to the agent; hardening audit disabled.' }
 

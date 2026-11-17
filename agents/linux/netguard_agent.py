@@ -30,8 +30,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
-AGENT_VERSION = "1.2.0"
+AGENT_VERSION = "1.3.0"
 
 DEFAULTS = {
     "server_url": "http://127.0.0.1:8787",
@@ -352,7 +353,8 @@ LOLBINS_LINUX = {"sh", "bash", "dash", "zsh", "ksh", "csh", "tcsh", "ash", "busy
 LOOKALIKE_LINUX = ["sshd", "systemd", "crond", "rsyslogd", "dbus-daemon", "kthreadd", "kworker", "auditd", "agetty",
                    "polkitd", "chronyd", "journald", "udevd", "nginx", "apache2", "httpd", "mysqld", "postgres", "containerd", "dockerd"]
 SUPPORTED_ACTIONS = ["block_ip", "unblock_ip", "block_port", "unblock_port", "kill_process", "quarantine_file",
-                     "restore_quarantine", "allow_process", "harden_fix", "harden_restore", "run_hardening_audit", "accept_listener"]
+                     "restore_quarantine", "allow_process", "harden_fix", "harden_restore", "run_hardening_audit", "accept_listener",
+                     "backup_run", "backup_test", "backup_restore"]
 HARDEN_BACKUP_ROOT = "/var/backups/netguard-hardening"
 PROTECTED_LINUX = {"systemd", "sshd", "dbus-daemon", "dbus-broker", "systemd-journal", "systemd-logind", "auditd", "rsyslogd",
                    "systemd-udevd", "systemd-network", "systemd-resolve", "containerd", "dockerd"}
@@ -1220,6 +1222,13 @@ class Agent:
         if a == "run_hardening_audit":
             self.state["harden_last"] = 0
             return "audit scheduled for this cycle"
+        if a in ("backup_run", "backup_test", "backup_restore"):
+            kind = {"backup_run": "backup", "backup_test": "test", "backup_restore": "restore"}[a]
+            target = p.get("target")
+            if target and not os.path.isabs(target):
+                raise ValueError("restore target must be an absolute path")
+            ref = self.spawn_backup(int(p["job_id"]), kind, p.get("archive"), target)
+            return "%s started (run %s). Progress and result appear under Backups." % (kind, ref[:8])
         raise ValueError("unsupported action %s" % a)
 
     def _run_all(self, cmds, ok_msg, tolerate_first=False):
@@ -1297,6 +1306,10 @@ class Agent:
         if self.hardening_summary:
             report["hardening"] = self.hardening_summary
         report["capabilities"] = {"supported": SUPPORTED_ACTIONS, "allowed_actions": self.cfg.get("allowed_actions")}
+        self.collect_backup_results()
+        outbox = list(self.state.get("backup_outbox") or [])
+        report["backup_results"] = outbox
+        report["backup_jobs_version"] = self.state.get("backup_jobs_version", "")
         if self.dry:
             print(json.dumps(report, indent=2))
             self.trust.save()
@@ -1315,6 +1328,10 @@ class Agent:
             log("received this server's own agent key; the join token is no longer used")
         self.state.save()          # persist the key immediately
         key = self.check_dashboard_key(resp)
+        sent = {r["run_ref"] + r.get("status", "") for r in outbox}
+        self.state["backup_outbox"] = [r for r in (self.state.get("backup_outbox") or []) if r["run_ref"] + r.get("status", "") not in sent]
+        if resp.get("backup_jobs"):
+            self.accept_backup_jobs(resp["backup_jobs"], key)
         rerun_audit = False
         for cmd in resp.get("commands", []):
             try:
@@ -1333,10 +1350,158 @@ class Agent:
                 self.post("/api/agent/command_result", result)
             except (urllib.error.URLError, OSError) as e:
                 log("could not report command result: %s" % e)
+        try:
+            self.schedule_backups()
+        except Exception as e:
+            log("backup scheduler error: %r" % e)
         self.trust.save()
         self.state.save()
         if rerun_audit:
             self.cycle(force_audit=True)
+
+    # ---- backups ---------------------------------------------------------------
+    def _bk_dir(self):
+        d = os.path.join(self.cfg["state_dir"], "backup-work")
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        return d
+
+    def load_backup_jobs(self):
+        try:
+            with open(os.path.join(self.cfg["state_dir"], "backup-jobs.json")) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return []
+
+    def accept_backup_jobs(self, bundle, key_b64):
+        env, sig = bundle.get("envelope", ""), bundle.get("sig", "")
+        if not key_b64 or not p256_verify(base64.b64decode(key_b64), env.encode("utf-8"), base64.b64decode(sig)):
+            log("backup job bundle has an invalid signature - ignored")
+            return
+        e = json.loads(env)
+        if str(e.get("host", "")).lower() != self.host.lower():
+            log("backup job bundle is for another server - ignored")
+            return
+        path = os.path.join(self.cfg["state_dir"], "backup-jobs.json")
+        fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(e["jobs"], f)
+        os.replace(path + ".tmp", path)
+        self.state["backup_jobs_version"] = e["version"]
+        log("backup jobs updated (%d job(s))" % len(e["jobs"]))
+
+    def spawn_backup(self, job_id, kind, archive=None, target=None):
+        job = {j["id"]: j for j in self.load_backup_jobs()}.get(int(job_id))
+        if not job:
+            raise ValueError("backup job %s is not known on this server yet (it arrives with the next report)" % job_id)
+        running = self.state.get("backup_running") or {}
+        if any(r["job_id"] == job["id"] for r in running.values()):
+            raise ValueError("a run of '%s' is already in progress" % job["name"])
+        ref = str(uuid.uuid4())
+        d = self._bk_dir()
+        jobfile, result = os.path.join(d, ref + ".job.json"), os.path.join(d, ref + ".result.json")
+        fd = os.open(jobfile, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(job, f)
+        runner = os.path.join(os.path.dirname(os.path.abspath(__file__)), "netguard_backup.py")
+        cmd = [sys.executable, runner, "--job", jobfile, "--mode", kind, "--result", result, "--run-ref", ref,
+               "--host", self.host, "--state-dir", self.cfg["state_dir"]]
+        if archive:
+            cmd += ["--archive", archive]
+        if target:
+            cmd += ["--target", target]
+        with open(os.path.join(d, ref + ".log"), "w") as lf:
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=lf, start_new_session=True)
+        self._children = getattr(self, "_children", {})
+        self._children[ref] = proc
+        running[ref] = {"job_id": job["id"], "kind": kind, "pid": proc.pid, "started": time.time(), "result": result, "jobfile": jobfile}
+        self.state["backup_running"] = running
+        self.state["backup_outbox"] = (self.state.get("backup_outbox") or []) + [
+            {"run_ref": ref, "job_id": job["id"], "kind": kind, "status": "running", "started": time.time()}]
+        log("started %s of '%s' (run %s)" % (kind, job["name"], ref[:8]))
+        return ref
+
+    def _alive(self, ref, pid):
+        proc = getattr(self, "_children", {}).get(ref)
+        if proc is not None:
+            return proc.poll() is None
+        try:
+            with open("/proc/%d/stat" % pid) as f:
+                return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+        except OSError:
+            return False
+
+    def collect_backup_results(self):
+        running = self.state.get("backup_running") or {}
+        outbox = self.state.get("backup_outbox") or []
+        last = self.state.get("backup_last") or {}
+        for ref, r in list(running.items()):
+            res = None
+            if os.path.exists(r["result"]):
+                with open(r["result"]) as f:
+                    res = json.load(f)
+            elif not self._alive(ref, r["pid"]) and time.time() - r["started"] > 5:
+                tail = ""
+                try:
+                    tail = open(os.path.join(self._bk_dir(), ref + ".log")).read()[-2000:]
+                except OSError:
+                    pass
+                res = {"run_ref": ref, "job_id": r["job_id"], "kind": r["kind"], "status": "failed", "started": r["started"],
+                       "finished": time.time(), "log": "the backup process ended without a result\n" + tail}
+            elif time.time() - r["started"] > 24 * 3600:
+                try:
+                    os.kill(r["pid"], signal.SIGKILL)
+                except OSError:
+                    pass
+                res = {"run_ref": ref, "job_id": r["job_id"], "kind": r["kind"], "status": "failed", "started": r["started"],
+                       "finished": time.time(), "log": "killed after running for more than 24 hours"}
+            if res is None:
+                continue
+            outbox.append(res)
+            jl = last.setdefault(str(r["job_id"]), {})
+            if res.get("status") == "ok":
+                jl["%s_ok" % r["kind"]] = res.get("finished") or time.time()
+            for fn in (r["result"], r["jobfile"], os.path.join(self._bk_dir(), ref + ".log")):
+                try:
+                    os.remove(fn)
+                except OSError:
+                    pass
+            getattr(self, "_children", {}).pop(ref, None)
+            del running[ref]
+            log("%s of job %s finished: %s" % (r["kind"], r["job_id"], res.get("status")))
+        self.state["backup_running"] = running
+        self.state["backup_outbox"] = outbox[-200:]
+        self.state["backup_last"] = last
+
+    @staticmethod
+    def backup_due(schedule, last_ts, now):
+        if schedule.get("mode") == "hourly":
+            return now - last_ts >= int(schedule.get("every", 24)) * 3600
+        hh, mm = [int(x) for x in schedule.get("at", "02:00").split(":")]
+        lt = time.localtime(now)
+        slot = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, hh, mm, 0, 0, 0, -1))
+        if slot > now:
+            slot -= 86400
+        return last_ts < slot
+
+    def schedule_backups(self):
+        now = time.time()
+        last = self.state.get("backup_last") or {}
+        busy = {r["job_id"] for r in (self.state.get("backup_running") or {}).values()}
+        for job in self.load_backup_jobs():
+            if job["id"] in busy:
+                continue
+            jl = last.setdefault(str(job["id"]), {})
+            try:
+                if self.backup_due(job["schedule"], jl.get("backup", 0), now):
+                    jl["backup"] = now
+                    self.spawn_backup(job["id"], "backup")
+                elif job.get("test_every_days") and jl.get("backup_ok") and now - max(jl.get("test", 0), jl.get("backup_ok", 0) - 3600) \
+                        >= job["test_every_days"] * 86400:
+                    jl["test"] = now
+                    self.spawn_backup(job["id"], "test")
+            except Exception as e:
+                log("backup scheduling error for job %s: %s" % (job.get("id"), e))
+        self.state["backup_last"] = last
 
     def check_dashboard_key(self, resp):
         """Pin the dashboard's command-signing key (installer-provided, or trust-on-first-use). Returns the key or None."""

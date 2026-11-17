@@ -21,7 +21,7 @@ param(
     [switch]$DryRun
 )
 $ErrorActionPreference = 'Stop'
-$AgentVersion = '1.2.0'
+$AgentVersion = '1.3.0'
 
 # ---------------------------------------------------------------------------
 # Config & state
@@ -680,7 +680,7 @@ function Get-ServerIp {
 function Get-RdpPort { $p = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -ErrorAction SilentlyContinue).PortNumber; if ($p) { $p } else { 3389 } }
 
 $Supported = @('block_ip', 'unblock_ip', 'block_port', 'unblock_port', 'kill_process', 'quarantine_file', 'restore_quarantine',
-    'allow_process', 'harden_fix', 'harden_restore', 'run_hardening_audit', 'accept_listener')
+    'allow_process', 'harden_fix', 'harden_restore', 'run_hardening_audit', 'accept_listener', 'backup_run', 'backup_test', 'backup_restore')
 $QuarantineDir = Join-Path $cfg.state_dir 'quarantine'
 $HardenBackupRoot = Join-Path $env:ProgramData 'NetGuard\hardening-backups'
 
@@ -841,6 +841,12 @@ function Invoke-Command_($cmd) {
             return "restored settings from $b`n$($log.Trim())"
         }
         'run_hardening_audit' { $State['harden_last'] = 0; return 'audit scheduled for this cycle' }
+        { $_ -in 'backup_run', 'backup_test', 'backup_restore' } {
+            $kind = @{ backup_run = 'backup'; backup_test = 'test'; backup_restore = 'restore' }[$cmd.action]
+            if ($p.target -and -not [IO.Path]::IsPathRooted("$($p.target)")) { throw 'restore target must be an absolute path' }
+            $ref = Start-BackupRun ([int]$p.job_id) $kind "$($p.archive)" "$($p.target)"
+            return "$kind started (run $($ref.Substring(0, 8))). Progress and result appear under Backups."
+        }
         default { throw "unsupported action $($cmd.action)" }
     }
 }
@@ -901,6 +907,103 @@ function Confirm-Command($c, [string]$keyB64) {
 }
 
 # ---------------------------------------------------------------------------
+# Backups (jobs arrive signed from the dashboard; runs happen in a separate process)
+# ---------------------------------------------------------------------------
+$BackupRunner = if ($cfg.backup_script) { $cfg.backup_script } else { Join-Path (Split-Path -Parent $PSCommandPath) 'NetGuard-Backup.ps1' }
+$BackupJobsFile = Join-Path $cfg.state_dir 'backup-jobs.json'
+$BackupWork = Join-Path $cfg.state_dir 'backup-work'
+
+function Get-BackupJobs {
+    if (-not (Test-Path $BackupJobsFile)) { return @() }
+    # PS 5.1 emits a JSON array as ONE object; unroll it and drop empties (an empty list must yield no jobs)
+    try { return @(Get-Content $BackupJobsFile -Raw | ConvertFrom-Json | ForEach-Object { $_ } | Where-Object { $_ -and $_.id }) } catch { return @() }
+}
+function Save-BackupJobs($bundle, [string]$keyB64) {
+    if (-not $keyB64 -or -not (Test-CommandSignature "$($bundle.envelope)" "$($bundle.sig)" $keyB64)) { Write-AgentLog 'backup job bundle has an invalid signature - ignored'; return }
+    $e = "$($bundle.envelope)" | ConvertFrom-Json
+    if ("$($e.host)" -ne $HostName) { Write-AgentLog 'backup job bundle is for another server - ignored'; return }
+    [IO.File]::WriteAllText($BackupJobsFile, (ConvertTo-Json -InputObject @($e.jobs) -Depth 8), (New-Object Text.UTF8Encoding($false)))
+    $State['backup_jobs_version'] = "$($e.version)"
+    Write-AgentLog "backup jobs updated ($(@($e.jobs).Count) job(s))"
+}
+function Start-BackupRun([int]$jobId, [string]$kind, [string]$archive = '', [string]$target = '') {
+    $job = Get-BackupJobs | Where-Object { [int]$_.id -eq $jobId } | Select-Object -First 1
+    if (-not $job) { throw "backup job $jobId is not known on this server yet (it arrives with the next report)" }
+    $running = if ($State['backup_running']) { $State['backup_running'] } else { @{} }
+    foreach ($k in @($running.Keys)) { if ([int]$running[$k].job_id -eq $jobId) { throw "a run of '$($job.name)' is already in progress" } }
+    if (-not (Test-Path $BackupRunner)) { throw "backup runner not found: $BackupRunner" }
+    New-Item -ItemType Directory -Path $BackupWork -Force | Out-Null
+    $ref = [guid]::NewGuid().ToString()
+    $jobFile = Join-Path $BackupWork "$ref.job.json"; $result = Join-Path $BackupWork "$ref.result.json"
+    [IO.File]::WriteAllText($jobFile, (ConvertTo-Json -InputObject $job -Depth 8), (New-Object Text.UTF8Encoding($false)))
+    $args_ = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', "`"$BackupRunner`"", '-JobFile', "`"$jobFile`"", '-Mode', $kind,
+        '-ResultFile', "`"$result`"", '-RunRef', $ref, '-HostName', $HostName, '-StateDir', "`"$($cfg.state_dir)`"")
+    if ($archive) { $args_ += @('-Archive', $archive) }
+    if ($target) { $args_ += @('-Target', "`"$target`"") }
+    $p = Start-Process powershell.exe -ArgumentList $args_ -WindowStyle Hidden -PassThru
+    $running[$ref] = @{ job_id = $jobId; kind = $kind; pid = $p.Id; started = $Now; proc_start = $p.StartTime.ToUniversalTime().ToString('o'); result = $result; jobfile = $jobFile }
+    $State['backup_running'] = $running
+    $State['backup_outbox'] = @(@($State['backup_outbox'] | Where-Object { $_ }) + @{ run_ref = $ref; job_id = $jobId; kind = $kind; status = 'running'; started = $Now })
+    Write-AgentLog "started $kind of '$($job.name)' (run $($ref.Substring(0, 8)))"
+    return $ref
+}
+function Update-BackupResults {
+    $running = if ($State['backup_running']) { $State['backup_running'] } else { @{} }
+    $outbox = @($State['backup_outbox'] | Where-Object { $_ })
+    $last = if ($State['backup_last']) { $State['backup_last'] } else { @{} }
+    foreach ($ref in @($running.Keys)) {
+        $r = $running[$ref]; $res = $null
+        if (Test-Path $r.result) { $res = ConvertTo-HashtableDeep (Get-Content $r.result -Raw | ConvertFrom-Json) }
+        else {
+            $p = Get-Process -Id $r.pid -ErrorAction SilentlyContinue
+            $alive = $p -and $p.StartTime.ToUniversalTime().ToString('o') -eq $r.proc_start
+            if (-not $alive -and $Now - [long]$r.started -gt 5) {
+                $res = @{ run_ref = $ref; job_id = $r.job_id; kind = $r.kind; status = 'failed'; started = $r.started; finished = $Now; log = 'the backup process ended without a result' }
+            } elseif ($alive -and $Now - [long]$r.started -gt 86400) {
+                Stop-Process -Id $r.pid -Force -ErrorAction SilentlyContinue
+                $res = @{ run_ref = $ref; job_id = $r.job_id; kind = $r.kind; status = 'failed'; started = $r.started; finished = $Now; log = 'killed after running for more than 24 hours' }
+            }
+        }
+        if (-not $res) { continue }
+        $outbox += $res
+        $jk = "$($r.job_id)"; if (-not $last[$jk]) { $last[$jk] = @{} }
+        if ($res.status -eq 'ok') { $last[$jk]["$($r.kind)_ok"] = $(if ($res.finished) { [long]$res.finished } else { $Now }) }
+        Remove-Item -LiteralPath $r.result, $r.jobfile -Force -ErrorAction SilentlyContinue
+        $running.Remove($ref)
+        Write-AgentLog "$($r.kind) of job $($r.job_id) finished: $($res.status)"
+    }
+    $State['backup_running'] = $running
+    $State['backup_outbox'] = @($outbox | Select-Object -Last 200)
+    $State['backup_last'] = $last
+}
+function Test-BackupDue($schedule, [long]$lastTs) {
+    if ($schedule.mode -eq 'hourly') { return ($Now - $lastTs) -ge ([int]$schedule.every * 3600) }
+    $hm = "$($schedule.at)".Split(':')
+    $slot = (Get-Date).Date.AddHours([int]$hm[0]).AddMinutes([int]$hm[1])
+    if ($slot -gt (Get-Date)) { $slot = $slot.AddDays(-1) }
+    $slotTs = ([DateTimeOffset]$slot).ToUnixTimeSeconds()
+    return $lastTs -lt $slotTs
+}
+function Invoke-BackupScheduler {
+    $last = if ($State['backup_last']) { $State['backup_last'] } else { @{} }
+    $busy = @(); $running = if ($State['backup_running']) { $State['backup_running'] } else { @{} }
+    foreach ($k in @($running.Keys)) { $busy += [int]$running[$k].job_id }
+    foreach ($job in Get-BackupJobs) {
+        $id = [int]$job.id
+        if ($busy -contains $id) { continue }
+        $jk = "$id"; if (-not $last[$jk]) { $last[$jk] = @{} }
+        $jl = $last[$jk]
+        try {
+            if (Test-BackupDue $job.schedule ([long]$jl['backup'])) { $jl['backup'] = $Now; $State['backup_last'] = $last; [void](Start-BackupRun $id 'backup') }
+            elseif ([int]$job.test_every_days -gt 0 -and $jl['backup_ok'] -and ($Now - [Math]::Max([long]$jl['test'], [long]$jl['backup_ok'] - 3600)) -ge [int]$job.test_every_days * 86400) {
+                $jl['test'] = $Now; $State['backup_last'] = $last; [void](Start-BackupRun $id 'test')
+            }
+        } catch { Write-AgentLog "backup scheduling error for job ${id}: $($_.Exception.Message)" }
+    }
+    $State['backup_last'] = $last
+}
+
+# ---------------------------------------------------------------------------
 # Cycle
 # ---------------------------------------------------------------------------
 function Invoke-Cycle([switch]$ForceAudit) {
@@ -923,6 +1026,10 @@ function Invoke-Cycle([switch]$ForceAudit) {
         alerts = @($Alerts); cleared = $cleared }
     if ($script:HardeningSummary) { $report.hardening = $script:HardeningSummary }
     $report.capabilities = @{ supported = $Supported; allowed_actions = $(if ($null -ne $cfg.allowed_actions) { @($cfg.allowed_actions) } else { $null }) }
+    try { Update-BackupResults } catch { Write-AgentLog "backup results: $($_.Exception.Message)" }
+    $sentOutbox = @($State['backup_outbox'] | Where-Object { $_ })
+    $report.backup_results = $sentOutbox
+    $report.backup_jobs_version = "$($State['backup_jobs_version'])"
 
     if ($DryRun) { ConvertTo-Json -InputObject $report -Depth 8; Save-State; return }
     try { $resp = Send-Json '/api/agent/report' $report }
@@ -933,6 +1040,9 @@ function Invoke-Cycle([switch]$ForceAudit) {
         Write-AgentLog "received this server's own agent key; the join token is no longer used"
     }
     $key = Get-DashboardKey $resp
+    $sentKeys = @($sentOutbox | ForEach-Object { "$($_.run_ref)$($_.status)" })
+    $State['backup_outbox'] = @($State['backup_outbox'] | Where-Object { $_ -and $sentKeys -notcontains "$($_.run_ref)$($_.status)" })
+    if ($resp.backup_jobs) { Save-BackupJobs $resp.backup_jobs $key }
     Save-State      # persist the key immediately
     $rerun = $false
     foreach ($c in @($resp.commands)) {
@@ -945,12 +1055,15 @@ function Invoke-Cycle([switch]$ForceAudit) {
         try { [void](Send-Json '/api/agent/command_result' $result) }
         catch { Write-AgentLog "could not report command result: $($_.Exception.Message)" }
     }
+    try { Invoke-BackupScheduler } catch { Write-AgentLog "backup scheduler: $($_.Exception.Message)" }
     Save-State
     if ($rerun) { Invoke-Cycle -ForceAudit }
 }
 
 # Single instance guard (scheduled task may overlap on a slow cycle)
-$mutex = New-Object Threading.Mutex($false, 'Global\NetGuardAgent')
+# one lock per config file: the installed agent, the lab and tests never block each other
+$lockId = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes(([IO.Path]::GetFullPath($ConfigPath)).ToLower()))).Replace('-', '').Substring(0, 16)
+$mutex = New-Object Threading.Mutex($false, "Global\NetGuardAgent-$lockId")
 if (-not $mutex.WaitOne(0)) { Write-AgentLog 'previous cycle still running, skipping'; exit 0 }
 try { Invoke-Cycle } catch { Write-AgentLog "cycle error: $($_.Exception.Message)"; throw } finally { $mutex.ReleaseMutex() }
 exit 0

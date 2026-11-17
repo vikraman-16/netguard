@@ -191,3 +191,9 @@ dialog h3 { margin: 0 0 8px; }
 .set-row label { display: flex; gap: 6px; align-items: center; font-size: 13px; }
 .set-row label.grow { flex: 1; min-width: 240px; }
 .set-row label.grow input { flex: 1; }
+/* ---- vault / backups ---- */
+dl.reveal { grid-template-columns: auto 1fr; }
+dl.reveal dd { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+dialog .note b { color: var(--text); }
+dialog .set-row input.field { width: auto; }
+dialog { max-height: 90vh; overflow-y: auto; width: min(560px, 94vw); }

@@ -75,7 +75,7 @@ foreach ($i in 1..30) {
 if (-not $ok) { throw "Dashboard did not start. Is port $Port in use? Try -Port 8788." }
 
 # ---- Windows agent (this PC) -----------------------------------------------
-$allowed = @('accept_listener', 'allow_process', 'kill_process', 'quarantine_file', 'restore_quarantine', 'run_hardening_audit', 'unblock_ip', 'unblock_port', 'harden_restore')
+$allowed = @('accept_listener', 'allow_process', 'kill_process', 'quarantine_file', 'restore_quarantine', 'run_hardening_audit', 'unblock_ip', 'unblock_port', 'harden_restore', 'backup_run', 'backup_test', 'backup_restore')
 $winCfg = [ordered]@{
     server_url = "http://127.0.0.1:$Port"; agent_token = $cfg.agent_token; host_name = "$env:COMPUTERNAME"
     state_dir = (Join-Path $Lab 'win-state'); harden_script = (Join-Path $Root 'hardening\windows\Harden-Server.ps1')
@@ -104,7 +104,7 @@ if (-not $NoLinux) {
     if ($distros -notcontains $Distro) {
         Write-Warning "WSL distro '$Distro' not found (have: $($distros -join ', ')). Skipping Linux. Use -Distro <name>."
     } else {
-        $wslRoot = (wsl.exe -d $Distro -- wslpath -a "$Root").Trim()
+        $wslRoot = (wsl.exe -d $Distro -- wslpath -a $Root.Replace('\', '/')).Trim()
         $wslProc = Start-Process wsl.exe -ArgumentList "-d $Distro -u root -- bash `"$wslRoot/lab/run-linux-agent.sh`" $Port $($cfg.agent_token) $Interval" `
             -PassThru -WindowStyle Minimized
         Write-Host "Linux agent started in WSL '$Distro' (as root)" -ForegroundColor Green

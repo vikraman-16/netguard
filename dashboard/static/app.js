@@ -98,6 +98,32 @@ const PLAYBOOK = {
     check: ["A 3rd-party AV can legitimately disable Defender. Malware also disables it."],
     options: "No other AV → <b>Apply hardening fix</b>. Other AV present → suppress on this host.",
   },
+  backup_failed: {
+    what: "The last backup run of this job failed, so the newest good copy is getting older.",
+    check: ["Open Backups → Runs → Log to see why (disk full, destination unreachable, database password changed, file locked…).",
+      "If only one destination failed, the other copy is still fine (the run shows per-destination results)."],
+    options: "Fix the cause, then <b>Run the backup now</b>. The alert clears on the next successful backup.",
+  },
+  backup_missing: {
+    what: "This backup job has never completed successfully.",
+    check: ["Is the agent on that server running and up to date (it receives the job with its next report)?", "Look at the job's runs for errors."],
+    options: "<b>Run the backup now</b> and watch the result under Backups.",
+  },
+  backup_stale: {
+    what: "The newest good backup is older than the job's RPO: if the server died now you'd lose more data than you agreed to.",
+    check: ["Has the server been offline, or are runs failing?", "Is the schedule still right for how often the data changes?"],
+    options: "<b>Run the backup now</b>; then fix whatever stopped the schedule.",
+  },
+  restore_untested: {
+    what: "Backups exist, but nobody has proven they can be restored recently. Untested backups often fail exactly when needed.",
+    check: ["Test restores download, decrypt, open and check the archive without touching the server."],
+    options: "<b>Run a test restore now</b>. Keep 'test every N days' on so this happens automatically.",
+  },
+  restore_test_failed: {
+    what: "A test restore failed: the backup could be damaged, missing from storage, or the key/settings changed.",
+    check: ["Open Backups → Runs to see which check failed (download, checksum, decrypt, contents).", "Was the storage bucket/folder changed or cleaned up?"],
+    options: "Fix the cause, run a new backup, then test again. Until then treat this job's backups as unusable.",
+  },
   agent_offline: {
     what: "The monitoring agent hasn't reported within the configured interval.",
     check: ["Is the host up (ping/console)?", "Is the agent's cron job / scheduled task still present and running?", "Did someone stop it? Attackers often kill monitoring."],
@@ -258,6 +284,10 @@ $$("[data-bulk]").forEach((b) => b.addEventListener("click", async () => {
 const ACTION_INFO = {
   harden_fix: { group: "fix", tone: "primary",
     effect: (a) => `${(a.evidence || {}).fix_changes || "Applies the recommended setting."} A backup is taken first, and you can undo it from "Actions taken" below.` },
+  backup_run: { group: "fix", tone: "primary",
+    effect: (a) => `Starts the backup job on ${a.host} now. The result appears under Backups, and this alert clears once a backup succeeds.` },
+  backup_test: { group: "fix", tone: "primary",
+    effect: (a) => `Downloads the latest backup on ${a.host}, checks its checksum, decrypts it, opens it and inspects database dumps. Nothing on the server is changed.` },
   run_hardening_audit: { group: "fix", tone: "",
     effect: () => "Re-checks this host's settings now instead of waiting for the next scheduled audit." },
   quarantine_file: { group: "contain", tone: "danger",
@@ -283,7 +313,8 @@ const ACTION_NAMES = {
   harden_fix: "Applied hardening fix", harden_restore: "Undid hardening fix", quarantine_file: "Quarantined file",
   restore_quarantine: "Restored file from quarantine", kill_process: "Killed process", block_ip: "Blocked IP",
   unblock_ip: "Unblocked IP", block_port: "Blocked port", unblock_port: "Unblocked port", allow_process: "Trusted program",
-  accept_listener: "Accepted port", run_hardening_audit: "Ran hardening audit",
+  accept_listener: "Accepted port", run_hardening_audit: "Ran hardening audit", backup_run: "Started backup",
+  backup_test: "Started test restore", backup_restore: "Started restore",
 };
 
 function expandSuggestions(a) {
@@ -653,6 +684,7 @@ async function loadMe() {
   $("#me-who").innerHTML = `<b>${esc(state.me.username)}</b><br><span class="muted">${esc(ROLE_HELP[state.me.role])}</span><br><span class="muted">${esc(serversText(state.me.hosts))}</span>`;
   $("#tab-btn-people").hidden = !isOwner();
   $("#tab-btn-settings").hidden = !isOwner();
+  $("#tab-btn-vault").hidden = !canAct();
   document.body.classList.toggle("readonly", !canAct());
 }
 
@@ -914,6 +946,264 @@ function openFromHash() {
 window.addEventListener("hashchange", openFromHash);
 
 // ---------------------------------------------------------------------------
+// Vault
+// ---------------------------------------------------------------------------
+async function loadVault() {
+  if (!canAct()) return;
+  const v = await api("/api/vault");
+  state.vault = v;
+  $("#vt-table tbody").innerHTML = v.items.map((it) => `<tr>
+    <td><b>${esc(it.name)}</b>${it.system ? ' <span class="status">auto</span>' : ""}</td>
+    <td>${esc(it.kind_label)}</td>
+    <td class="small">${Object.entries(it.fields).filter(([k, val]) => val && k !== "notes").slice(0, 3).map(([k, val]) => `${esc(k)}: <span class="mono">${esc(val)}</span>`).join("<br>")}</td>
+    <td>${esc(it.host || "–")}</td>
+    <td class="small">${esc(it.access.join(", "))}</td>
+    <td>${ago(it.updated_at)} <span class="muted small">${esc(it.updated_by || "")}</span></td>
+    <td style="white-space:nowrap"><button class="btn small" data-vshow="${it.id}">Show</button>
+      <button class="btn small" data-vedit="${it.id}">Edit</button>
+      <button class="btn small" data-vshare="${it.id}">Share</button>
+      <button class="btn small" data-vdel="${it.id}">Delete</button></td></tr>`).join("")
+    || '<tr><td colspan="7" class="empty">Nothing stored yet. Add server logins, database credentials or cloud storage keys.</td></tr>';
+  const log = await api("/api/vault/log");
+  $("#vt-log").innerHTML = log.slice(0, 40).map((l) => `<li><span class="muted">${esc(fmtTime(l.ts))}</span> · <b>${esc(l.user)}</b> ${esc(l.action)} <span class="muted">${esc(l.item_name || "")}</span></li>`).join("") || '<li class="muted">No access yet.</li>';
+}
+
+function vaultForm(kind, item) {
+  const k = state.vault.kinds[kind];
+  const hosts = state.hosts.map((h) => h.name);
+  return `<label class="note">Name<input id="vf-name" class="field" value="${esc(item ? item.name : "")}"></label>
+    <label class="note">Server (optional)<select id="vf-host" class="field"><option value="">–</option>${hosts.map((h) =>
+      `<option ${item && item.host === h ? "selected" : ""}>${esc(h)}</option>`).join("")}</select></label>
+    ${k.fields.map((f) => `<label class="note">${esc(f.label)}${f.secret ? " (encrypted)" : ""}
+      ${f.key === "notes" ? `<textarea class="field vf-field" data-key="${f.key}" rows="2">${f.secret ? "" : esc(item ? item.fields[f.key] || "" : "")}</textarea>`
+        : `<input class="field vf-field" data-key="${f.key}" ${f.secret ? 'type="password" autocomplete="new-password"' : ""}
+          placeholder="${f.secret && item ? "unchanged" : ""}" value="${f.secret ? "" : esc(item ? item.fields[f.key] || "" : "")}">`}</label>`).join("")}`;
+}
+function readVaultForm() {
+  const fields = {};
+  $$(".vf-field").forEach((i) => (fields[i.dataset.key] = i.value));
+  return { name: $("#vf-name").value, host: $("#vf-host").value, fields };
+}
+
+async function stepUp() {
+  const res = await confirmBox("Confirm it's you", "Enter the current 6-digit code from your authenticator app. You won't be asked again for 10 minutes.",
+    '<label class="note">2-factor code<input id="su-code" class="field" inputmode="numeric" autocomplete="one-time-code" maxlength="7"></label>');
+  if (!res) return false;
+  try { await api("/api/vault/stepup", { code: $("#su-code").value }); return true; }
+  catch (e) { toast(e.message, true); return false; }
+  finally { $("#su-code").value = ""; }
+}
+async function revealItem(id) {
+  let r;
+  try { r = await api(`/api/vault/items/${id}/reveal`, {}); }
+  catch (e) {
+    if (!/2-factor/.test(e.message)) return toast(e.message, true);
+    if (!(await stepUp())) return;
+    r = await api(`/api/vault/items/${id}/reveal`, {});
+  }
+  const it = state.vault.items.find((x) => x.id === id);
+  const kind = state.vault.kinds[it.kind];
+  await confirmBox(it.name, "Close this window when you're done. The values are not kept in the page.",
+    `<dl class="kv reveal">${kind.fields.filter((f) => r.fields[f.key]).map((f) => `<dt>${esc(f.label.split(" (")[0])}</dt>
+      <dd><span class="mono">${esc(r.fields[f.key])}</span> ${f.secret ? `<button type="button" class="btn small" data-copyval="${esc(r.fields[f.key])}">Copy</button>` : ""}</dd>`).join("")}</dl>`);
+  $("#confirm-extra").innerHTML = "";
+  loadVault();
+}
+document.addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-copyval]");
+  if (!b) return;
+  e.preventDefault();
+  try { await navigator.clipboard.writeText(b.dataset.copyval); toast("Copied"); } catch (err) { toast("Copy failed", true); }
+});
+
+$("#vt-new").addEventListener("click", async () => {
+  const kinds = state.vault.kinds;
+  const pick = await confirmBox("Add to the vault", "What kind of item?",
+    `<label class="note">Type<select id="vf-kind" class="field">${Object.entries(kinds).map(([k, v]) => `<option value="${k}">${esc(v.label)}</option>`).join("")}</select></label>`);
+  if (!pick) return;
+  const kind = $("#vf-kind").value;
+  const res = await confirmBox(kinds[kind].label, "Secret fields are encrypted before they are stored.", vaultForm(kind));
+  if (!res) return;
+  try { await api("/api/vault/items", Object.assign({ kind }, readVaultForm())); toast("Saved"); } catch (err) { toast(err.message, true); }
+  $$(".vf-field").forEach((i) => (i.value = ""));
+  loadVault();
+});
+$("#vt-table").addEventListener("click", async (e) => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  const id = +(b.dataset.vshow || b.dataset.vedit || b.dataset.vshare || b.dataset.vdel);
+  const it = state.vault.items.find((x) => x.id === id);
+  try {
+    if (b.dataset.vshow) return revealItem(id);
+    if (b.dataset.vedit) {
+      const res = await confirmBox(`Edit ${it.name}`, "Leave secret fields empty to keep them.", vaultForm(it.kind, it));
+      if (!res) return;
+      await api(`/api/vault/items/${id}/update`, readVaultForm());
+      $$(".vf-field").forEach((i) => (i.value = ""));
+      toast("Saved");
+    } else if (b.dataset.vshare) {
+      const res = await confirmBox(`Share ${it.name}`, "Owners can always use every item. Choose which admins may use this one.",
+        `<div class="hostpick">${state.vault.people.map((u) => `<label><input type="checkbox" class="vs-user" value="${esc(u)}" ${it.access.includes(u) ? "checked" : ""}> ${esc(u)}</label>`).join("")}</div>`);
+      if (!res) return;
+      await api(`/api/vault/items/${id}/share`, { users: $$(".vs-user").filter((c) => c.checked).map((c) => c.value) });
+      toast("Sharing updated");
+    } else if (b.dataset.vdel) {
+      if (!(await confirmBox(`Delete ${it.name}?`, "This can't be undone.", "", true))) return;
+      await api(`/api/vault/items/${id}/delete`, {});
+      toast("Deleted");
+    }
+  } catch (err) { toast(err.message, true); }
+  loadVault();
+});
+
+// ---------------------------------------------------------------------------
+// Backups
+// ---------------------------------------------------------------------------
+function bytes(n) { if (!n) return "–"; const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0; while (n >= 1024 && i < 4) { n /= 1024; i++; } return n.toFixed(i ? 1 : 0) + " " + u[i]; }
+function runCell(r, okRun) {
+  if (!r) return '<span class="muted">never</span>';
+  const st = r.status === "ok" ? "resolved" : r.status === "running" ? "pending" : "failed";
+  return `<span class="status ${st}">${esc(r.status)}</span> ${ago(r.finished || r.started)}${r.size ? `<div class="muted small">${bytes(r.size)}${r.files ? " · " + r.files + " files" : ""}</div>` : ""}
+    ${r.status !== "ok" && okRun ? `<div class="muted small">last good: ${ago(okRun.finished)}</div>` : ""}`;
+}
+async function loadBackups() {
+  const data = await api("/api/backups");
+  state.backups = data;
+  const unhealthy = data.jobs.filter((j) => j.health.length).length;
+  $("#badge-backups").textContent = unhealthy || "";
+  $("#bk-new").hidden = !canAct();
+  $("#bk-table tbody").innerHTML = data.jobs.map((j) => {
+    const s = j.spec, src = s.sources;
+    const what = [src.website && "website", src.config && "server config", src.folders.length && src.folders.length + " folder(s)", src.databases.length && src.databases.length + " database(s)"].filter(Boolean).join(", ");
+    const where = s.destinations.map((d) => (d.type === "local" ? esc(d.path) : "S3 (vault #" + d.vault_id + ")")).join("<br>");
+    const sched = s.schedule.mode === "daily" ? `daily ${s.schedule.at}` : `every ${s.schedule.every} h`;
+    return `<tr>
+      <td><b>${esc(j.name)}</b><div class="muted small">${esc(j.host)}${j.enabled ? "" : " · disabled"}</div>
+        ${j.health.map((h) => `<div class="small"><span class="sev ${esc(h[1])}">${esc(h[2])}</span></div>`).join("")}</td>
+      <td class="small">${what}</td><td class="small mono">${where}</td>
+      <td class="small">${sched}<div class="muted">keep ${s.retention.keep_last} / ${s.retention.keep_days} days · RPO ${s.rpo_hours} h${s.test_every_days ? " · test every " + s.test_every_days + " d" : ""}</div></td>
+      <td>${runCell(j.last.backup, j.last.backup_ok)}</td><td>${s.test_every_days || j.last.test ? runCell(j.last.test, j.last.test_ok) : '<span class="muted">off</span>'}</td>
+      <td style="white-space:nowrap">${canAct() ? `<button class="btn small" data-bkrun="${j.id}">Run now</button>
+        <button class="btn small" data-bktest="${j.id}">Test restore</button>
+        <button class="btn small" data-bkrestore="${j.id}">Restore…</button>` : ""}
+        <button class="btn small" data-bkruns="${j.id}">Runs</button>
+        ${canAct() ? `<button class="btn small" data-bkedit="${j.id}">Edit</button> <button class="btn small" data-bkkey="${j.recovery_item}">Recovery key</button>
+        <button class="btn small" data-bkdel="${j.id}">Delete</button>` : ""}</td></tr>`;
+  }).join("") || `<tr><td colspan="7" class="empty">No backup jobs yet.${canAct() ? " Create one: websites, databases, folders and server configuration, stored locally and/or in S3." : ""}</td></tr>`;
+}
+
+function jobForm(job) {
+  const v = state.vault || { items: [] };
+  const s = job ? job.spec : { sources: { website: false, config: true, folders: [], excludes: [], databases: [] }, destinations: [], schedule: { mode: "daily", at: "02:00" },
+    retention: { keep_last: 7, keep_days: 30 }, rpo_hours: 24, test_every_days: 7 };
+  const dbs = v.items.filter((i) => i.kind === "database"), s3s = v.items.filter((i) => i.kind === "s3");
+  const locals = s.destinations.filter((d) => d.type === "local").map((d) => d.path).join("\n");
+  const s3sel = s.destinations.filter((d) => d.type === "s3").map((d) => d.vault_id);
+  return `<label class="note">Server<select id="bf-host" class="field" ${job ? "disabled" : ""}>${state.backups.hosts.map((h) => `<option ${job && job.host === h ? "selected" : ""}>${esc(h)}</option>`).join("")}</select></label>
+    <label class="note">Name<input id="bf-name" class="field" value="${esc(job ? job.name : "Daily backup")}"></label>
+    <div class="note"><b>What to back up</b>
+      <label><span><input type="checkbox" id="bf-web" ${s.sources.website ? "checked" : ""}> Website files and web-server config (IIS / nginx / Apache presets)</span></label>
+      <label><span><input type="checkbox" id="bf-cfg" ${s.sources.config ? "checked" : ""}> Server configuration (firewall, tasks/cron, services, packages, network, users)</span></label>
+      <label class="note">Folders, one per line<textarea id="bf-folders" class="field" rows="2" placeholder="D:\\Data\\uploads  or  /srv/app/data">${esc(s.sources.folders.join("\n"))}</textarea></label>
+      <label class="note">Skip files matching (one per line, e.g. *.tmp, *\\cache\\*)<textarea id="bf-ex" class="field" rows="1">${esc(s.sources.excludes.join("\n"))}</textarea></label>
+      <div class="note">Databases (from the Vault)${dbs.length ? `<div class="hostpick">${dbs.map((d) => `<label><input type="checkbox" class="bf-db" value="${d.id}" ${s.sources.databases.includes(d.id) ? "checked" : ""}> ${esc(d.name)} <span class="muted small">${esc(d.fields.engine || "")}</span></label>`).join("")}</div>`
+        : ' <span class="muted small">none yet: add a "Database" item in the Vault first</span>'}</div></div>
+    <div class="note"><b>Where to store it</b> <span class="muted small">(3-2-1: use a local copy AND an off-site copy)</span>
+      <label class="note">Local / USB / network folders, one per line<textarea id="bf-local" class="field" rows="2" placeholder="E:\\Backups  or  \\\\nas\\backups  or  /mnt/backup">${esc(locals)}</textarea></label>
+      <div class="note">Cloud storage (S3-compatible, from the Vault)${s3s.length ? `<div class="hostpick">${s3s.map((d) => `<label><input type="checkbox" class="bf-s3" value="${d.id}" ${s3sel.includes(d.id) ? "checked" : ""}> ${esc(d.name)}</label>`).join("")}</div>`
+        : ' <span class="muted small">none yet: add an "S3-compatible storage" item in the Vault</span>'}</div></div>
+    <div class="set-row">
+      <label>Run <select id="bf-mode" class="field"><option value="daily" ${s.schedule.mode === "daily" ? "selected" : ""}>daily at</option><option value="hourly" ${s.schedule.mode === "hourly" ? "selected" : ""}>every N hours</option></select></label>
+      <input id="bf-at" class="field" style="width:80px" value="${esc(s.schedule.at || "02:00")}" title="HH:MM">
+      <input id="bf-every" class="field" style="width:60px" type="number" min="1" max="168" value="${s.schedule.every || 6}" title="hours">
+    </div>
+    <div class="set-row">
+      <label>Keep last <input id="bf-keep" class="field" style="width:60px" type="number" min="1" value="${s.retention.keep_last}"></label>
+      <label>and anything newer than <input id="bf-days" class="field" style="width:60px" type="number" min="0" value="${s.retention.keep_days}"> days</label>
+    </div>
+    <div class="set-row">
+      <label>RPO (max data loss) <input id="bf-rpo" class="field" style="width:60px" type="number" min="1" value="${s.rpo_hours}"> h</label>
+      <label>Test-restore every <input id="bf-test" class="field" style="width:60px" type="number" min="0" value="${s.test_every_days}"> days (0 = off)</label>
+    </div>`;
+}
+function readJobForm() {
+  const lines = (id) => $(id).value.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
+  return {
+    host: $("#bf-host").value, name: $("#bf-name").value,
+    sources: { website: $("#bf-web").checked, config: $("#bf-cfg").checked, folders: lines("#bf-folders"), excludes: lines("#bf-ex"),
+      databases: $$(".bf-db").filter((c) => c.checked).map((c) => +c.value) },
+    destinations: lines("#bf-local").map((p) => ({ type: "local", path: p })).concat($$(".bf-s3").filter((c) => c.checked).map((c) => ({ type: "s3", vault_id: +c.value }))),
+    schedule: $("#bf-mode").value === "daily" ? { mode: "daily", at: $("#bf-at").value } : { mode: "hourly", every: +$("#bf-every").value },
+    retention: { keep_last: +$("#bf-keep").value, keep_days: +$("#bf-days").value },
+    rpo_hours: +$("#bf-rpo").value, test_every_days: +$("#bf-test").value,
+  };
+}
+
+$("#bk-new").addEventListener("click", async () => {
+  if (canAct()) state.vault = await api("/api/vault").catch(() => ({ items: [] }));
+  if (!state.backups.hosts.length) return toast("No servers have reported yet.", true);
+  const res = await confirmBox("New backup job", "Runs on the chosen server; the first backup starts within a minute or two.", jobForm(null));
+  if (!res) return;
+  try {
+    const r = await api("/api/backups/jobs", readJobForm());
+    await confirmBox("Store the recovery key OFFLINE", "Without this key the backups can't be decrypted. It's also saved in the Vault, but if this dashboard is lost, the Vault is lost with it. Print it or save it in a password manager now.",
+      `<div class="linkbox"><input id="lk" class="field mono" readonly value="${esc(r.recovery_key)}"><button type="button" class="btn" id="lk-copy">Copy</button></div>
+       <p class="small muted">Decrypt without NetGuard: <code>python tools/ng-decrypt.py ARCHIVE.ngbk out.zip --key KEY</code></p>`);
+    $("#lk").value = "";
+    toast("Backup job created");
+  } catch (err) { toast(err.message, true); }
+  loadBackups();
+});
+
+$("#bk-table").addEventListener("click", async (e) => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  const jid = +(b.dataset.bkrun || b.dataset.bktest || b.dataset.bkrestore || b.dataset.bkruns || b.dataset.bkedit || b.dataset.bkdel || 0);
+  const job = state.backups.jobs.find((j) => j.id === jid);
+  try {
+    if (b.dataset.bkrun || b.dataset.bktest) {
+      const action = b.dataset.bkrun ? "backup_run" : "backup_test";
+      await api(`/api/hosts/${encodeURIComponent(job.host)}/action`, { action, params: { job_id: jid } });
+      toast(action === "backup_run" ? "Backup starts within a minute" : "Test restore starts within a minute");
+    } else if (b.dataset.bkrestore) {
+      const runs = (await api(`/api/backups/${jid}/runs`)).filter((r) => r.kind === "backup" && r.status === "ok" && r.archive);
+      const res = await confirmBox(`Restore ${job.name}`, "Files are extracted into a NEW folder on the server; nothing existing is overwritten. Database dumps land in its databases\\ folder. Import them with the steps in the DR runbook.",
+        `<label class="note">Backup<select id="rs-arch" class="field"><option value="">latest</option>${runs.map((r) => `<option>${esc(r.archive)}</option>`).join("")}</select></label>
+         <label class="note">Restore into (empty or new folder; blank = NetGuard's restores folder)<input id="rs-target" class="field" placeholder="D:\\Restore\\site-2026-11-17"></label>`, true);
+      if (!res) return;
+      const params = { job_id: jid };
+      if ($("#rs-arch").value) params.archive = $("#rs-arch").value;
+      if ($("#rs-target").value.trim()) params.target = $("#rs-target").value.trim();
+      await api(`/api/hosts/${encodeURIComponent(job.host)}/action`, { action: "backup_restore", params });
+      toast("Restore starts within a minute. See Runs for the result.");
+    } else if (b.dataset.bkruns) {
+      const runs = await api(`/api/backups/${jid}/runs`);
+      await confirmBox(`Runs of ${job.name}`, "",
+        `<ul class="timeline">${runs.map((r) => `<li><span class="status ${r.status === "ok" ? "resolved" : r.status === "running" ? "pending" : "failed"}">${esc(r.status)}</span>
+          <b>${esc(r.kind)}</b> ${ago(r.finished || r.started)} <span class="muted small">${esc(r.archive || "")} ${r.size ? bytes(r.size) : ""} ${r.details && r.details.duration_s ? r.details.duration_s + " s" : ""}</span>
+          ${r.details && r.details.checks ? `<div class="small">${r.details.checks.map((c) => `${c.ok ? "✔" : "✘"} ${esc(c.check)} <span class="muted">${esc(c.detail || "")}</span>`).join("<br>")}</div>` : ""}
+          ${r.details && r.details.restored_to ? `<div class="small">restored to <code>${esc(r.details.restored_to)}</code></div>` : ""}
+          ${r.log ? `<details><summary class="muted small">Log</summary><pre class="mono evidence">${esc(r.log)}</pre></details>` : ""}</li>`).join("") || '<li class="muted">No runs yet.</li>'}</ul>`);
+    } else if (b.dataset.bkedit) {
+      state.vault = await api("/api/vault").catch(() => ({ items: [] }));
+      const res = await confirmBox(`Edit ${job.name}`, "", jobForm(job));
+      if (!res) return;
+      await api(`/api/backups/jobs/${jid}/update`, Object.assign(readJobForm(), { host: job.host }));
+      toast("Saved");
+    } else if (b.dataset.bkkey) {
+      state.vault = await api("/api/vault");
+      if (!state.vault.items.find((x) => x.id === +b.dataset.bkkey)) return toast("The recovery key isn't shared with you. Ask an owner.", true);
+      return revealItem(+b.dataset.bkkey);
+    } else if (b.dataset.bkdel) {
+      if (!(await confirmBox(`Delete ${job.name}?`, "Stops future backups. Existing archives and the recovery key are kept.", "", true))) return;
+      await api(`/api/backups/jobs/${jid}/delete`, {});
+      toast("Deleted");
+    }
+  } catch (err) { toast(err.message, true); }
+  loadBackups();
+});
+
+// ---------------------------------------------------------------------------
 async function refresh() {
   try {
     await loadSummary();
@@ -924,6 +1214,8 @@ async function refresh() {
     if (state.tab === "audit") await loadAudit();
     if (state.tab === "people") await loadPeople();
     if (state.tab === "settings") await loadSettings();
+    if (state.tab === "backups") await loadBackups();
+    if (state.tab === "vault") await loadVault();
   } catch (e) { toast("Refresh failed: " + e.message, true); }
 }
 setInterval(() => {

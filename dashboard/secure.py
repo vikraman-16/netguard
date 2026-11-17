@@ -71,6 +71,12 @@ class KeyStore:
         return json.loads(pt) if as_json else pt.decode("utf-8")
 
     # ---- command signing ---------------------------------------------------
+    def sign_payload(self, text):
+        """Sign an arbitrary string (UTF-8); returns base64 r||s."""
+        der = self.signing.sign(text.encode("utf-8"), ec.ECDSA(hashes.SHA256()))
+        r, s = decode_dss_signature(der)
+        return base64.b64encode(r.to_bytes(32, "big") + s.to_bytes(32, "big")).decode()
+
     def sign_command(self, cid, host, action, params):
         now = int(time.time())
         envelope = json.dumps({"id": cid, "host": host, "action": action, "params": params, "issued": now,

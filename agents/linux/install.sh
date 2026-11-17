@@ -38,6 +38,8 @@ HARDEN="$HERE/../../hardening/linux/harden.sh"
 install -d -m 755 /opt/netguard
 install -d -m 700 /etc/netguard /var/lib/netguard
 install -m 755 "$HERE/netguard_agent.py" /opt/netguard/netguard_agent.py
+install -m 755 "$HERE/netguard_backup.py" /opt/netguard/netguard_backup.py
+command -v openssl >/dev/null || echo "note: install the openssl package for encrypted backups"
 [[ -f "$HARDEN" ]] && install -m 755 "$HARDEN" /opt/netguard/harden.sh
 
 trusted_json="[]"

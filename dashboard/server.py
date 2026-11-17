@@ -32,8 +32,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from auth import INVITE_TTL, SESSION_MAX, AuthError, AuthManager  # noqa: E402
 from notify import Notifier  # noqa: E402
 from secure import KeyStore  # noqa: E402
+from vault import Vault, VaultError  # noqa: E402
+from backups import Backups, BackupError  # noqa: E402
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 SESSION_COOKIE = "ng_session"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -132,6 +134,11 @@ ACTIONS = {
     "harden_restore": {"label": "Undo hardening fix (restore backup)", "params": {"backup": _valid_path}},
     "run_hardening_audit": {"label": "Run hardening audit now", "params": {}},
     "accept_listener": {"label": "Accept listener into baseline", "params": {"port": _valid_port, "protocol": _valid_proto}},
+    "backup_run": {"label": "Run backup now", "params": {"job_id": lambda v: int(v)}},
+    "backup_test": {"label": "Test-restore the latest backup", "params": {"job_id": lambda v: int(v)},
+                    "optional": {"archive": _valid_name}},
+    "backup_restore": {"label": "Restore a backup into a new folder", "params": {"job_id": lambda v: int(v)},
+                       "optional": {"archive": _valid_name, "target": _valid_path}},
 }
 
 
@@ -308,6 +315,10 @@ class NetGuard:
             pass
         self.auth = AuthManager(self.db, cfg, config_path)
         self.notifier = Notifier(self)
+        self.vault = Vault(self)
+        self.backups = Backups(self)
+        self.ingest_extra = self.backups.agent_extra
+        self.digest_extra = self.backups.digest_lines
 
     # ---- settings (key/value, JSON) ----------------------------------------
     def get_setting(self, key, default=None):
@@ -398,6 +409,9 @@ class NetGuard:
             try:
                 if time.time() - (self.get_setting("last_db_backup", 0) or 0) > 86400:
                     self.backup_db()
+                if time.time() - getattr(self, "_last_health", 0) > 300:
+                    self._last_health = time.time()
+                    self.backups.check_health()
                 hour = int(self.get_setting("digest_hour", 8))
                 today = time.strftime("%Y-%m-%d")
                 if time.localtime().tm_hour >= hour and self.get_setting("last_digest", "") != today:
@@ -907,7 +921,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _user(self, need="viewer", write=False, page=False):
         """Returns the signed-in user row, or sends 401/403 (or a redirect for pages) and returns None."""
-        u, _ = self.app.auth.session_user(self._cookie())
+        u, sess = self.app.auth.session_user(self._cookie())
+        self._sess = sess
         if not u:
             if page:
                 self._redirect("/login")
@@ -965,6 +980,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {k: v["label"] for k, v in ACTIONS.items()})
             if path == "/api/sessions":
                 return self._send(200, self.app.auth.sessions(user))
+            if path == "/api/vault":
+                if not AuthManager.can(user, "admin"):
+                    return self._send(403, {"error": "The vault is for admins and owners."})
+                return self._send(200, {"items": self.app.vault.list(user), "kinds": self.app.vault.kinds(),
+                                        "stepup_ok": bool(self.app.vault.stepup_ok(self._sess)),
+                                        "people": [u["username"] for u in self.app.db.q(
+                                            "SELECT username FROM users WHERE role IN ('owner','admin') AND disabled=0 ORDER BY username")]})
+            if path == "/api/vault/log":
+                if not AuthManager.can(user, "admin"):
+                    return self._send(403, {"error": "The vault is for admins and owners."})
+                return self._send(200, self.app.vault.log(user))
+            if path == "/api/backups":
+                return self._send(200, {"jobs": self.app.backups.list(scope), "hosts": [h["name"] for h in self.app.hosts(scope)]})
+            m = re.match(r"^/api/backups/(\d+)/runs$", path)
+            if m:
+                return self._send(200, self.app.backups.runs(int(m.group(1)), scope))
             if path in ("/api/settings", "/api/notify/channels"):
                 if not AuthManager.can(user, "owner"):
                     return self._send(403, {"error": "Only owners can see settings."})
@@ -1081,6 +1112,42 @@ class Handler(BaseHTTPRequestHandler):
             # everything below changes things: admins and owners only
             if not AuthManager.can(user, "admin"):
                 return self._send(403, {"error": "Your role (viewer) is read-only."})
+
+            # ---- vault ----
+            ip = self._client_ip()
+            if path == "/api/vault/stepup":
+                self.app.vault.stepup(user, self._sess, body.get("code"))
+                return self._send(200, {"ok": True})
+            if path == "/api/vault/items":
+                return self._send(200, {"id": self.app.vault.save(user, body, ip=ip)})
+            m = re.match(r"^/api/vault/items/(\d+)/(update|reveal|share|delete)$", path)
+            if m:
+                iid, op = int(m.group(1)), m.group(2)
+                if op == "update":
+                    return self._send(200, {"id": self.app.vault.save(user, body, iid, ip=ip)})
+                if op == "reveal":
+                    try:
+                        return self._send(200, {"fields": self.app.vault.reveal(user, self._sess, iid, ip)})
+                    except PermissionError:
+                        return self._send(403, {"error": "Enter a fresh 2-factor code to see secrets.", "stepup": True})
+                if op == "share":
+                    return self._send(200, {"access": self.app.vault.share(user, iid, body.get("users") or [], ip)})
+                self.app.vault.delete(user, iid, ip)
+                return self._send(200, {"ok": True})
+
+            # ---- backup jobs ----
+            if path == "/api/backups/jobs" or re.match(r"^/api/backups/jobs/\d+/(update|delete)$", path):
+                m = re.match(r"^/api/backups/jobs/(\d+)/(update|delete)$", path)
+                if m:
+                    job = self.app.db.one("SELECT host FROM backup_jobs WHERE id=?", (int(m.group(1)),))
+                    if not job or (scope is not None and job["host"] not in scope):
+                        return self._send(404, {"error": "job not found"})
+                    if m.group(2) == "delete":
+                        self.app.backups.delete(user, int(m.group(1)))
+                        return self._send(200, {"ok": True})
+                if scope is not None and body.get("host") not in scope:
+                    return self._send(404, {"error": "unknown server"})
+                return self._send(200, self.app.backups.save(user, body, int(m.group(1)) if m else None))
             m = re.match(r"^/api/alerts/(\d+)/(status|action)$", path)
             if m:
                 aid = int(m.group(1))
@@ -1105,7 +1172,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.app.delete_suppression(name, int(m.group(1)), scope, is_owner)
                 return self._send(200, {"ok": True})
             return self._send(404, {"error": "not found"})
-        except AuthError as e:
+        except (AuthError, VaultError, BackupError) as e:
             return self._send(400, {"error": str(e)})
         except PermissionError as e:
             return self._send(403, {"error": str(e)})

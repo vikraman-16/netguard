@@ -50,7 +50,7 @@ Start-Process $demo -ArgumentList "$secs" -WindowStyle Hidden
 Write-Host "Windows decoys running for $Minutes min." -ForegroundColor Green
 
 if (-not $NoLinux) {
-    $wslRoot = (wsl.exe -d $Distro -- wslpath -a "$Root").Trim()
+    $wslRoot = (wsl.exe -d $Distro -- wslpath -a $Root.Replace('\', '/')).Trim()
     Start-Process wsl.exe -ArgumentList "-d $Distro -- bash `"$wslRoot/lab/decoys-linux.sh`" $secs" -WindowStyle Hidden
     Write-Host "Linux decoys running in WSL '$Distro' for $Minutes min." -ForegroundColor Green
 }

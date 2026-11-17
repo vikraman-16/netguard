@@ -15,6 +15,8 @@
   <nav class="tabs" role="tablist">
     <button data-tab="alerts" class="active">Alerts <span id="badge-alerts" class="pill"></span></button>
     <button data-tab="hosts">Hosts</button>
+    <button data-tab="backups">Backups <span id="badge-backups" class="pill"></span></button>
+    <button data-tab="vault" id="tab-btn-vault" hidden>Vault</button>
     <button data-tab="commands">Actions <span id="badge-cmds" class="pill muted"></span></button>
     <button data-tab="suppressions">Suppressions</button>
     <button data-tab="audit">Audit log</button>
@@ -88,6 +90,28 @@
 
   <section class="panel" id="tab-hosts" hidden>
     <div class="host-grid" id="host-grid"></div>
+  </section>
+
+  <section class="panel" id="tab-backups" hidden>
+    <div class="people-head">
+      <div><b>Backups</b> <span class="muted small">Encrypted, scheduled, retention-managed, and test-restored automatically. Each job has its own recovery key (also in the Vault): keep a copy offline.</span></div>
+      <button class="btn primary act-only" id="bk-new">New backup job</button>
+    </div>
+    <div class="table-wrap"><table class="grid" id="bk-table">
+      <thead><tr><th>Job</th><th>What</th><th>Where</th><th>Schedule</th><th>Last backup</th><th>Last test restore</th><th></th></tr></thead>
+      <tbody></tbody></table></div>
+  </section>
+
+  <section class="panel" id="tab-vault" hidden>
+    <div class="people-head">
+      <div><b>Vault</b> <span class="muted small">Encrypted credentials and keys. Showing a secret needs a fresh 2-factor code (valid 10 min) and is logged.</span></div>
+      <button class="btn primary" id="vt-new">Add item</button>
+    </div>
+    <div class="table-wrap"><table class="grid" id="vt-table">
+      <thead><tr><th>Name</th><th>Type</th><th>Details</th><th>Server</th><th>Shared with</th><th>Updated</th><th></th></tr></thead>
+      <tbody></tbody></table></div>
+    <h3 style="margin-top:20px">Access log</h3>
+    <ul class="timeline" id="vt-log"></ul>
   </section>
 
   <section class="panel" id="tab-commands" hidden>
