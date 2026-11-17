@@ -652,6 +652,7 @@ async function loadMe() {
   $("#me-role").className = "role " + state.me.role;
   $("#me-who").innerHTML = `<b>${esc(state.me.username)}</b><br><span class="muted">${esc(ROLE_HELP[state.me.role])}</span><br><span class="muted">${esc(serversText(state.me.hosts))}</span>`;
   $("#tab-btn-people").hidden = !isOwner();
+  $("#tab-btn-settings").hidden = !isOwner();
   document.body.classList.toggle("readonly", !canAct());
 }
 
@@ -784,6 +785,135 @@ $("#people-table").addEventListener("click", async (e) => {
 });
 
 // ---------------------------------------------------------------------------
+// Settings (owners): notifications, agent keys, dashboard data
+// ---------------------------------------------------------------------------
+const SEV_LABEL = { critical: "Critical only", high: "High and above", medium: "Medium and above", low: "Low and above", info: "Everything" };
+
+async function loadSettings() {
+  if (!isOwner()) return;
+  const [s, n] = await Promise.all([api("/api/settings"), api("/api/notify/channels")]);
+  state.settings = s; state.notify = n;
+  $("#ch-table tbody").innerHTML = n.channels.map((c) => `<tr>
+    <td><b>${esc(c.name)}</b>${c.enabled ? "" : ' <span class="status">off</span>'}</td>
+    <td>${esc((n.types[c.type] || {}).label || c.type)}</td>
+    <td>${esc(SEV_LABEL[c.min_severity] || c.min_severity)}</td>
+    <td>${c.digest ? "yes" : "no"}</td>
+    <td class="small">${c.last_status ? `<span class="${c.last_status === "ok" ? "status resolved" : "status failed"}">${esc(c.last_status.slice(0, 80))}</span> ${ago(c.last_at)}` : '<span class="muted">not used yet</span>'}</td>
+    <td style="white-space:nowrap"><button class="btn small" data-chtest="${c.id}">Send test</button>
+      <button class="btn small" data-chedit="${c.id}">Edit</button> <button class="btn small" data-chdel="${c.id}">Delete</button></td></tr>`).join("")
+    || '<tr><td colspan="6" class="empty">No channels yet. Add one so critical alerts reach you even when the dashboard is closed.</td></tr>';
+  $("#set-digest-hour").innerHTML = Array.from({ length: 24 }, (_, h) => `<option value="${h}" ${h === s.digest_hour ? "selected" : ""}>${String(h).padStart(2, "0")}:00</option>`).join("");
+  $("#set-url").value = s.dashboard_url || "";
+  $("#set-enroll").checked = s.allow_enrollment;
+  $("#set-fp").textContent = s.command_key_fingerprint;
+  $("#set-dir").textContent = s.data_dir;
+  $("#keys-table tbody").innerHTML = s.hosts.map((h) => `<tr><td>${esc(h.name)}</td>
+    <td>${h.has_key ? '<span class="status resolved">own key</span>' : h.pending ? '<span class="status pending">being issued</span>' : '<span class="status open">join token only</span>'}</td>
+    <td>${ago(h.last_seen)}</td>
+    <td style="white-space:nowrap"><button class="btn small" data-hkreset="${esc(h.name)}">Reset key</button> <button class="btn small" data-hkremove="${esc(h.name)}">Remove server</button></td></tr>`).join("")
+    || '<tr><td colspan="4" class="empty">No servers yet.</td></tr>';
+  $("#db-backups").innerHTML = s.db_backups.map((b) => `<li class="mono small">${esc(b.name)} · ${(b.size / 1024).toFixed(0)} KB · ${ago(b.mtime)}</li>`).join("") || '<li class="muted">No backups yet (first one is made within a minute of starting).</li>';
+}
+
+function channelForm(type, existing) {
+  const t = state.notify.types[type];
+  const cfg = (existing && existing.config) || {};
+  return `<label class="note">Name<input id="ch-name" class="field" value="${esc(existing ? existing.name : t.label)}"></label>
+    ${t.fields.map((f) => `<label class="note">${esc(f.label)}${f.secret ? " (stored encrypted)" : ""}
+      <input class="field ch-field" data-key="${f.key}" ${f.secret ? 'type="password" autocomplete="off"' : ""}
+        placeholder="${f.secret && existing && cfg[f.key] ? "unchanged (" + esc(cfg[f.key]) + ")" : ""}" value="${f.secret ? "" : esc(cfg[f.key] || "")}"></label>`).join("")}
+    <label class="note">Send alerts of<select id="ch-sev" class="field">${Object.entries(SEV_LABEL).map(([k, v]) =>
+      `<option value="${k}" ${(existing ? existing.min_severity : "high") === k ? "selected" : ""}>${v}</option>`).join("")}</select></label>
+    <label class="note"><span><input type="checkbox" id="ch-digest" ${!existing || existing.digest ? "checked" : ""}> Also send the daily summary</span></label>
+    <label class="note"><span><input type="checkbox" id="ch-enabled" ${!existing || existing.enabled ? "checked" : ""}> Enabled</span></label>`;
+}
+function readChannelForm() {
+  const cfg = {};
+  $$(".ch-field").forEach((i) => (cfg[i.dataset.key] = i.value));
+  return { name: $("#ch-name").value, config: cfg, min_severity: $("#ch-sev").value, digest: $("#ch-digest").checked, enabled: $("#ch-enabled").checked };
+}
+
+$("#ch-add").addEventListener("click", async () => {
+  const types = state.notify.types;
+  const pick = await confirmBox("Add a notification channel", "Where should alerts be sent?",
+    `<label class="note">Type<select id="ch-type" class="field">${Object.entries(types).map(([k, v]) => `<option value="${k}">${esc(v.label)}</option>`).join("")}</select></label>
+     <p class="small muted">Telegram: create a bot with @BotFather, message it once, then get your chat ID from https://api.telegram.org/bot&lt;token&gt;/getUpdates.
+     Teams: in the channel choose Workflows → "Post to a channel when a webhook request is received". Discord: Channel settings → Integrations → Webhooks.</p>`);
+  if (!pick) return;
+  const type = $("#ch-type").value;
+  const res = await confirmBox(types[type].label, "After saving, use “Send test” to check it works.", channelForm(type));
+  if (!res) return;
+  try { await api("/api/notify/channels", Object.assign({ type }, readChannelForm())); toast("Channel saved"); loadSettings(); }
+  catch (e) { toast(e.message, true); }
+});
+
+$("#ch-table").addEventListener("click", async (e) => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  try {
+    if (b.dataset.chtest) {
+      b.disabled = true; b.textContent = "Sending…";
+      const r = await api(`/api/notify/channels/${b.dataset.chtest}/test`, {});
+      toast(r.ok ? "Test message sent" : "Failed: " + r.detail, !r.ok);
+    } else if (b.dataset.chedit) {
+      const ch = state.notify.channels.find((c) => c.id === +b.dataset.chedit);
+      const res = await confirmBox(`Edit ${ch.name}`, "Leave secret fields empty to keep the stored value.", channelForm(ch.type, ch));
+      if (!res) return;
+      await api(`/api/notify/channels/${ch.id}/update`, readChannelForm());
+      toast("Saved");
+    } else if (b.dataset.chdel) {
+      if (!(await confirmBox("Delete this channel?", "Alerts will no longer be sent there."))) return;
+      await api(`/api/notify/channels/${b.dataset.chdel}/delete`, {});
+    }
+  } catch (err) { toast(err.message, true); }
+  loadSettings();
+});
+
+$("#set-save").addEventListener("click", async () => {
+  try {
+    await api("/api/settings", { digest_hour: +$("#set-digest-hour").value, dashboard_url: $("#set-url").value });
+    toast("Saved");
+  } catch (e) { toast(e.message, true); }
+});
+$("#digest-now").addEventListener("click", async () => { await api("/api/settings/digest-now", {}); toast("Summary sent"); loadSettings(); });
+$("#set-enroll").addEventListener("change", async (e) => {
+  await api("/api/settings", { allow_enrollment: e.target.checked });
+  toast(e.target.checked ? "New servers can join" : "New servers are refused");
+});
+$("#jt-show").addEventListener("click", async () => {
+  const r = await api("/api/settings/join-token", {});
+  await confirmBox("Join token", "Use it when installing the agent on a new server (-Token / --token). Viewing it is logged.",
+    `<div class="linkbox"><input id="lk" class="field" readonly value="${esc(r.token)}"><button type="button" class="btn" id="lk-copy">Copy</button></div>`);
+});
+$("#jt-rotate").addEventListener("click", async () => {
+  if (!(await confirmBox("Rotate the join token?", "The old token stops working for new servers. Servers that already have their own key keep working.", "", true))) return;
+  const r = await api("/api/settings/rotate-join-token", {});
+  await confirmBox("New join token", "Copy it now for your next agent install.",
+    `<div class="linkbox"><input id="lk" class="field" readonly value="${esc(r.token)}"><button type="button" class="btn" id="lk-copy">Copy</button></div>`);
+});
+$("#keys-table").addEventListener("click", async (e) => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  const h = b.dataset.hkreset || b.dataset.hkremove;
+  const reset = !!b.dataset.hkreset;
+  if (!(await confirmBox(reset ? `Reset ${h}'s agent key?` : `Remove ${h}?`,
+    reset ? "Use this if the agent lost its key (reinstall). It can then re-join once with the join token."
+          : "The server disappears from the dashboard (its alert history stays). If its agent is still running it will try to re-join.", "", !reset))) return;
+  try { await api(`/api/hosts/${encodeURIComponent(h)}/${reset ? "reset-key" : "remove"}`, {}); toast("Done"); } catch (err) { toast(err.message, true); }
+  loadSettings();
+});
+$("#db-backup-now").addEventListener("click", async () => {
+  try { const r = await api("/api/settings/backup-db", {}); toast("Backed up"); loadSettings(); } catch (e) { toast(e.message, true); }
+});
+
+// deep links from notifications: /#alert=123
+function openFromHash() {
+  const m = location.hash.match(/^#alert=(\d+)$/);
+  if (m) { openAlert(+m[1]).catch(() => toast("That alert isn't available to you.", true)); history.replaceState(null, "", "/"); }
+}
+window.addEventListener("hashchange", openFromHash);
+
+// ---------------------------------------------------------------------------
 async function refresh() {
   try {
     await loadSummary();
@@ -793,6 +923,7 @@ async function refresh() {
     if (state.tab === "suppressions") await loadSuppressions();
     if (state.tab === "audit") await loadAudit();
     if (state.tab === "people") await loadPeople();
+    if (state.tab === "settings") await loadSettings();
   } catch (e) { toast("Refresh failed: " + e.message, true); }
 }
 setInterval(() => {
@@ -801,4 +932,4 @@ setInterval(() => {
     if (state.openAlert) openAlert(state.openAlert).catch(() => {});
   }
 }, 10000);
-loadMe().then(refresh).catch((e) => toast(e.message, true));
+loadMe().then(refresh).then(openFromHash).catch((e) => toast(e.message, true));

@@ -15,6 +15,7 @@ Run:  netguard_agent.py --config /etc/netguard/agent.json --daemon
 Must run as root for firewall changes, auth logs and process names.
 """
 import argparse
+import base64
 import ipaddress
 import json
 import os
@@ -30,7 +31,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-AGENT_VERSION = "1.0.0"
+AGENT_VERSION = "1.2.0"
 
 DEFAULTS = {
     "server_url": "http://127.0.0.1:8787",
@@ -248,6 +249,82 @@ def journal_lines(state, key, args):
 # ---------------------------------------------------------------------------
 # Agent
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Command signatures: ECDSA P-256 / SHA-256 verification (verify only, standard library)
+# The dashboard signs every command; the agent pins the dashboard's public key and refuses anything else.
+# ---------------------------------------------------------------------------
+_P = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff
+_N = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551
+_B = 0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b
+_G = (0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296,
+      0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5)
+_INF = (0, 1, 0)
+
+
+def _jdouble(p):
+    x1, y1, z1 = p
+    if z1 == 0 or y1 == 0:
+        return _INF
+    delta = z1 * z1 % _P
+    gamma = y1 * y1 % _P
+    beta = x1 * gamma % _P
+    alpha = 3 * (x1 - delta) * (x1 + delta) % _P
+    x3 = (alpha * alpha - 8 * beta) % _P
+    z3 = ((y1 + z1) * (y1 + z1) - gamma - delta) % _P
+    y3 = (alpha * (4 * beta - x3) - 8 * gamma * gamma) % _P
+    return (x3, y3, z3)
+
+
+def _jadd(p, q):
+    if p[2] == 0:
+        return q
+    if q[2] == 0:
+        return p
+    x1, y1, z1 = p
+    x2, y2, z2 = q
+    z1z1, z2z2 = z1 * z1 % _P, z2 * z2 % _P
+    u1, u2 = x1 * z2z2 % _P, x2 * z1z1 % _P
+    s1, s2 = y1 * z2 * z2z2 % _P, y2 * z1 * z1z1 % _P
+    if u1 == u2:
+        return _jdouble(p) if s1 == s2 else _INF
+    h, r = (u2 - u1) % _P, (s2 - s1) % _P
+    h2 = h * h % _P
+    h3 = h * h2 % _P
+    u1h2 = u1 * h2 % _P
+    x3 = (r * r - h3 - 2 * u1h2) % _P
+    y3 = (r * (u1h2 - x3) - s1 * h3) % _P
+    return (x3, y3, h * z1 * z2 % _P)
+
+
+def _jmul(k, pt):
+    acc, q = _INF, (pt[0], pt[1], 1)
+    while k:
+        if k & 1:
+            acc = _jadd(acc, q)
+        q = _jdouble(q)
+        k >>= 1
+    return acc
+
+
+def p256_verify(pub_raw, msg, sig):
+    """pub_raw = X||Y (64 bytes), sig = r||s (64 bytes, IEEE P1363), msg = bytes. Returns bool."""
+    if len(pub_raw) != 64 or len(sig) != 64:
+        return False
+    qx, qy = int.from_bytes(pub_raw[:32], "big"), int.from_bytes(pub_raw[32:], "big")
+    if not (0 < qx < _P and 0 < qy < _P) or (qy * qy - (qx * qx * qx - 3 * qx + _B)) % _P:
+        return False   # not a point on the curve
+    r, s = int.from_bytes(sig[:32], "big"), int.from_bytes(sig[32:], "big")
+    if not (1 <= r < _N and 1 <= s < _N):
+        return False
+    e = int.from_bytes(hashlib.sha256(msg).digest(), "big")
+    w = pow(s, _N - 2, _N)
+    pt = _jadd(_jmul(e * w % _N, _G), _jmul(r * w % _N, (qx, qy)))
+    if pt[2] == 0:
+        return False
+    zi = pow(pt[2], _P - 2, _P)
+    return (pt[0] * zi * zi % _P) % _N == r
+
+
 # ---------------------------------------------------------------------------
 # Process trust: core-daemon allowlist + package-manager integrity checks
 # ---------------------------------------------------------------------------
@@ -1178,8 +1255,9 @@ class Agent:
         return ssl.create_default_context(cafile=self.cfg.get("ca_file") or None)
 
     def post(self, path, payload):
+        token = self.state.get("host_token") or self.cfg["agent_token"]   # own key once issued, join token before
         req = urllib.request.Request(self.cfg["server_url"].rstrip("/") + path, data=json.dumps(payload).encode(),
-                                     headers={"Content-Type": "application/json", "X-Agent-Token": self.cfg["agent_token"],
+                                     headers={"Content-Type": "application/json", "X-Agent-Token": token,
                                               "User-Agent": "netguard-agent/" + AGENT_VERSION}, method="POST")
         with urllib.request.urlopen(req, timeout=30, context=self._ctx()) as r:
             return json.loads(r.read().decode())
@@ -1232,10 +1310,16 @@ class Agent:
             self.state.save()  # keep log offsets; conditions are re-sent next time
             return
         self.state["conditions"] = sorted(self.conditions)
+        if resp.get("agent_token"):
+            self.state["host_token"] = resp["agent_token"]
+            log("received this server's own agent key; the join token is no longer used")
+        self.state.save()          # persist the key immediately
+        key = self.check_dashboard_key(resp)
         rerun_audit = False
         for cmd in resp.get("commands", []):
             try:
-                out = self.execute(cmd)
+                action, params = self.verify_command(cmd, key)
+                out = self.execute({"id": cmd["id"], "action": action, "params": params})
                 status = "done"
             except Exception as e:
                 out, status = "%s: %s" % (type(e).__name__, e), "failed"
@@ -1253,6 +1337,42 @@ class Agent:
         self.state.save()
         if rerun_audit:
             self.cycle(force_audit=True)
+
+    def check_dashboard_key(self, resp):
+        """Pin the dashboard's command-signing key (installer-provided, or trust-on-first-use). Returns the key or None."""
+        offered = resp.get("command_public_key") or ""
+        pinned = self.cfg.get("command_public_key") or self.state.get("command_key")
+        if not pinned and offered:
+            self.state["command_key"] = pinned = offered
+            log("pinned the dashboard's command-signing key (first contact)")
+        if pinned and offered and offered != pinned:
+            log("WARNING: the dashboard offered a DIFFERENT command key than the pinned one - refusing all commands. "
+                "If the dashboard was reinstalled on purpose, delete command_key from %s/agent-state.json" % self.cfg["state_dir"])
+            return None
+        return pinned
+
+    def verify_command(self, cmd, key_b64):
+        """Returns (action, params) from the signed envelope, or raises."""
+        if not key_b64:
+            raise PermissionError("no trusted dashboard key - command refused")
+        env, sig = cmd.get("envelope"), cmd.get("sig")
+        if not env or not sig:
+            raise PermissionError("unsigned command refused")
+        if not p256_verify(base64.b64decode(key_b64), env.encode("utf-8"), base64.b64decode(sig)):
+            raise PermissionError("invalid signature - command refused")
+        e = json.loads(env)
+        now = time.time()
+        if str(e.get("host", "")).lower() != self.host.lower():
+            raise PermissionError("command is for %s, not this server - refused" % e.get("host"))
+        if e.get("id") != cmd.get("id"):
+            raise PermissionError("command id mismatch - refused")
+        if e.get("expires", 0) < now - 300 or e.get("issued", 0) > now + 300:
+            raise PermissionError("command expired or from the future (check the clock) - refused")
+        seen = self.state.get("seen_cmds") or []
+        if e["id"] in seen:
+            raise PermissionError("command already executed (replay) - refused")
+        self.state["seen_cmds"] = (seen + [e["id"]])[-500:]
+        return e["action"], e.get("params") or {}
 
     def _os_name(self):
         try:

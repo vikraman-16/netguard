@@ -19,6 +19,7 @@
     <button data-tab="suppressions">Suppressions</button>
     <button data-tab="audit">Audit log</button>
     <button data-tab="people" id="tab-btn-people" hidden>People</button>
+    <button data-tab="settings" id="tab-btn-settings" hidden>Settings</button>
   </nav>
   <div class="top-right">
     <label class="auto"><input type="checkbox" id="autorefresh" checked> Live</label>
@@ -125,6 +126,41 @@
         <thead><tr><th>Person</th><th>Device</th><th>From</th><th>Signed in</th><th>Last active</th><th></th></tr></thead>
         <tbody></tbody>
       </table>
+    </div>
+  </section>
+
+  <section class="panel" id="tab-settings" hidden>
+    <div class="settings-grid">
+      <div class="set-card">
+        <div class="people-head"><b>Notifications</b><button class="btn primary" id="ch-add">Add channel</button></div>
+        <p class="muted small">New alerts at or above each channel's level are sent right away (max 20 per hour per channel), plus an optional daily summary.</p>
+        <div class="table-wrap"><table class="grid" id="ch-table">
+          <thead><tr><th>Name</th><th>Type</th><th>Sends</th><th>Summary</th><th>Last result</th><th></th></tr></thead><tbody></tbody></table></div>
+        <div class="set-row">
+          <label>Daily summary at <select id="set-digest-hour" class="field"></select></label>
+          <label class="grow">Link in messages <input id="set-url" class="field" placeholder="https://my-pc.tail1234.ts.net"></label>
+          <button class="btn" id="set-save">Save</button>
+          <button class="btn" id="digest-now">Send summary now</button>
+        </div>
+      </div>
+      <div class="set-card">
+        <div class="people-head"><b>Servers &amp; agent keys</b></div>
+        <p class="muted small">A new server joins once with the <i>join token</i>, then gets its own key; the join token stops working for it.
+          Every command is signed by this dashboard and verified by the agent (key fingerprint <code id="set-fp"></code>).</p>
+        <div class="set-row">
+          <label><input type="checkbox" id="set-enroll"> Allow new servers to join</label>
+          <button class="btn" id="jt-show">Show join token</button>
+          <button class="btn" id="jt-rotate">Rotate join token</button>
+        </div>
+        <div class="table-wrap"><table class="grid" id="keys-table">
+          <thead><tr><th>Server</th><th>Agent key</th><th>Last report</th><th></th></tr></thead><tbody></tbody></table></div>
+      </div>
+      <div class="set-card">
+        <div class="people-head"><b>Dashboard data</b><button class="btn" id="db-backup-now">Back up now</button></div>
+        <p class="muted small">The dashboard database is copied every day (last 14 kept) to <code id="set-dir"></code>\db-backups.
+          <b>Also keep a copy of <code>netguard.key</code> somewhere safe and offline</b>: without it, saved secrets (vault, notification passwords, cloud keys) can't be decrypted.</p>
+        <ul class="timeline" id="db-backups"></ul>
+      </div>
     </div>
   </section>
 

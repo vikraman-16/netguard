@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 # NetGuard Linux agent installer
-#   sudo ./install.sh --server https://netguard.example.com:8787 --token <agent_token> [--insecure] [--trusted 10.0.0.5,10.0.0.0/24]
+#   sudo ./install.sh --server https://netguard.example.com:8787 --token <join_token> [--command-key <key>] [--insecure] [--trusted 10.0.0.5,10.0.0.0/24]
+#   (--command-key: contents of command-signing.pub from the dashboard data folder; pins the dashboard that may send commands)
 #   sudo ./install.sh --uninstall
 set -euo pipefail
 
-SERVER=""; TOKEN=""; INSECURE=0; TRUSTED=""; UNINSTALL=0
+SERVER=""; TOKEN=""; INSECURE=0; TRUSTED=""; UNINSTALL=0; CMDKEY=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --server) SERVER="$2"; shift ;;
     --token) TOKEN="$2"; shift ;;
     --insecure) INSECURE=1 ;;
     --trusted) TRUSTED="$2"; shift ;;
+    --command-key) CMDKEY="$2"; shift ;;
     --uninstall) UNINSTALL=1 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
@@ -54,6 +56,7 @@ if [[ ! -f /etc/netguard/agent.json ]]; then
   "hardening_interval_minutes": 360,
   "blocklist_file": "/etc/netguard/blocklist.txt",
   "trusted_ips": $trusted_json,
+  "command_public_key": "$CMDKEY",
   "thresholds": {
     "auth_failures": 10, "auth_window_seconds": 600, "port_scan_ports": 15,
     "conn_per_ip": 200, "rx_mbps": 500, "tx_mbps": 500,

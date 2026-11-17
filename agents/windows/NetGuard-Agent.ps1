@@ -21,7 +21,7 @@ param(
     [switch]$DryRun
 )
 $ErrorActionPreference = 'Stop'
-$AgentVersion = '1.0.0'
+$AgentVersion = '1.2.0'
 
 # ---------------------------------------------------------------------------
 # Config & state
@@ -853,7 +853,51 @@ if (-not $cfg.verify_tls) { [Net.ServicePointManager]::ServerCertificateValidati
 function Send-Json([string]$path, $payload) {
     $body = [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $payload -Depth 8 -Compress))
     return Invoke-RestMethod -Uri ($cfg.server_url.TrimEnd('/') + $path) -Method Post -Body $body -ContentType 'application/json; charset=utf-8' `
-        -Headers @{ 'X-Agent-Token' = $cfg.agent_token } -UserAgent "netguard-agent/$AgentVersion" -TimeoutSec 30 -UseBasicParsing
+        -Headers @{ 'X-Agent-Token' = $(if ($State['host_token']) { $State['host_token'] } else { $cfg.agent_token }) } -UserAgent "netguard-agent/$AgentVersion" -TimeoutSec 30 -UseBasicParsing
+}
+
+# ---------------------------------------------------------------------------
+# Command signatures (ECDSA P-256 / SHA-256, verified with Windows CNG)
+# ---------------------------------------------------------------------------
+function Get-DashboardKey($resp) {
+    $offered = "$($resp.command_public_key)"
+    $pinned = if ($cfg.command_public_key) { "$($cfg.command_public_key)" } else { "$($State['command_key'])" }
+    if (-not $pinned -and $offered) {
+        $State['command_key'] = $pinned = $offered
+        Write-AgentLog "pinned the dashboard's command-signing key (first contact)"
+    }
+    if ($pinned -and $offered -and $offered -ne $pinned) {
+        Write-AgentLog "WARNING: dashboard offered a DIFFERENT command key than the pinned one - refusing all commands. If the dashboard was reinstalled on purpose, remove command_key from agent-state.json"
+        return $null
+    }
+    return $pinned
+}
+function Test-CommandSignature([string]$payload, [string]$sigB64, [string]$keyB64) {
+    try {
+        $pub = [Convert]::FromBase64String($keyB64)
+        if ($pub.Length -ne 64) { return $false }
+        $blob = New-Object byte[] 72
+        [BitConverter]::GetBytes([uint32]0x31534345).CopyTo($blob, 0)    # BCRYPT_ECDSA_PUBLIC_P256_MAGIC
+        [BitConverter]::GetBytes([uint32]32).CopyTo($blob, 4)
+        [Array]::Copy($pub, 0, $blob, 8, 64)
+        $key = [Security.Cryptography.CngKey]::Import($blob, [Security.Cryptography.CngKeyBlobFormat]::EccPublicBlob)
+        $ec = New-Object Security.Cryptography.ECDsaCng($key)
+        $ec.HashAlgorithm = [Security.Cryptography.CngAlgorithm]::Sha256
+        return $ec.VerifyData([Text.Encoding]::UTF8.GetBytes($payload), [Convert]::FromBase64String($sigB64))
+    } catch { return $false }
+}
+function Confirm-Command($c, [string]$keyB64) {
+    if (-not $keyB64) { throw 'no trusted dashboard key - command refused' }
+    if (-not $c.envelope -or -not $c.sig) { throw 'unsigned command refused' }
+    if (-not (Test-CommandSignature "$($c.envelope)" "$($c.sig)" $keyB64)) { throw 'invalid signature - command refused' }
+    $e = "$($c.envelope)" | ConvertFrom-Json
+    if ("$($e.host)" -ne $HostName) { throw "command is for $($e.host), not this server - refused" }
+    if ([long]$e.id -ne [long]$c.id) { throw 'command id mismatch - refused' }
+    if ([long]$e.expires -lt $Now - 300 -or [long]$e.issued -gt $Now + 300) { throw 'command expired or from the future (check the clock) - refused' }
+    $seen = @($State['seen_cmds'] | Where-Object { $null -ne $_ })
+    if ($seen -contains [long]$e.id) { throw 'command already executed (replay) - refused' }
+    $State['seen_cmds'] = @(@($seen + [long]$e.id) | Select-Object -Last 500)
+    return [pscustomobject]@{ id = $e.id; action = "$($e.action)"; params = $e.params }
 }
 
 # ---------------------------------------------------------------------------
@@ -884,10 +928,16 @@ function Invoke-Cycle([switch]$ForceAudit) {
     try { $resp = Send-Json '/api/agent/report' $report }
     catch { Write-AgentLog "report failed: $($_.Exception.Message)"; Save-State; return }
     $State['conditions'] = [string[]]@($Conditions)
+    if ($resp.agent_token) {
+        $State['host_token'] = "$($resp.agent_token)"
+        Write-AgentLog "received this server's own agent key; the join token is no longer used"
+    }
+    $key = Get-DashboardKey $resp
+    Save-State      # persist the key immediately
     $rerun = $false
     foreach ($c in @($resp.commands)) {
         if (-not $c) { continue }
-        try { $out = Invoke-Command_ $c; $st = 'done' } catch { $out = "$($_.Exception.Message)"; $st = 'failed'; $script:Undo = $null }
+        try { $verified = Confirm-Command $c $key; $out = Invoke-Command_ $verified; $st = 'done' } catch { $out = "$($_.Exception.Message)"; $st = 'failed'; $script:Undo = $null }
         Write-AgentLog "command $($c.id) $($c.action) -> $st"
         if ($c.action -in 'harden_fix', 'run_hardening_audit') { $rerun = $true }
         $result = @{ host = $HostName; id = $c.id; status = $st; output = "$out" }

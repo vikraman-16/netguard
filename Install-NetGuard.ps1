@@ -163,6 +163,9 @@ try {
 
     Write-Host '[2/4] Installing agent...' -ForegroundColor Cyan
     $agentArgs = @{ Server = $url; Token = $cfg.agent_token }
+    $pubFile = Join-Path $env:ProgramData 'NetGuard-Dashboard\command-signing.pub'
+    foreach ($i in 1..20) { if (Test-Path $pubFile) { break }; Start-Sleep -Milliseconds 500 }
+    if (Test-Path $pubFile) { $agentArgs.CommandKey = (Get-Content $pubFile -Raw).Trim() }
     if ($FullControl) { $agentArgs.FullControl = $true } else { $agentArgs.SafeMode = $true }
     $agentCfg = Join-Path $env:ProgramData 'NetGuard\agent.json'
     if (Test-Path $agentCfg) {

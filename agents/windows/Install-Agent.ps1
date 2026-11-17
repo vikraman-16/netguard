@@ -20,6 +20,7 @@ param(
     [switch]$Insecure,
     [switch]$NoFirewallLogging,
     [switch]$SafeMode,
+    [string]$CommandKey = '',
     [switch]$FullControl,
     [switch]$Uninstall
 )
@@ -68,9 +69,15 @@ if (-not (Test-Path $cfgPath)) {
             rx_mbps = 500; tx_mbps = 500; cpu_pct = 90; cpu_cycles = 5; mem_pct = 90; disk_pct = 90 }
     }
     if ($SafeMode) { $cfg.allowed_actions = $SafeActions }
+    if ($CommandKey) { $cfg.command_public_key = $CommandKey }
     ConvertTo-Json -InputObject $cfg -Depth 4 | Set-Content -Path $cfgPath -Encoding UTF8
 } else {
     $cur = Get-Content $cfgPath -Raw | ConvertFrom-Json
+    if ($CommandKey) {
+        $cur.PSObject.Properties.Remove('command_public_key')
+        $cur | Add-Member -NotePropertyName command_public_key -NotePropertyValue $CommandKey
+        ConvertTo-Json -InputObject $cur -Depth 4 | Set-Content -Path $cfgPath -Encoding UTF8
+    }
     if ($SafeMode -or $FullControl) {
         $cur.PSObject.Properties.Remove('allowed_actions')
         if ($SafeMode) { $cur | Add-Member -NotePropertyName allowed_actions -NotePropertyValue $SafeActions }

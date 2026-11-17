@@ -49,6 +49,15 @@ if (-not $python) { throw 'No machine-wide Python 3 found. Install Python from p
 $ver = & $python -c "import sys; print('%d.%d' % sys.version_info[:2])"
 if ([version]$ver -lt [version]'3.8') { throw "Python $ver is too old (need 3.8+)." }
 
+# The dashboard encrypts stored secrets and signs agent commands with the 'cryptography' package.
+& $python -c "import cryptography" 2>$null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host 'Installing the Python "cryptography" package (needs internet)...'
+    & $python -m pip install --disable-pip-version-check --quiet cryptography
+    & $python -c "import cryptography" 2>$null
+    if ($LASTEXITCODE -ne 0) { throw 'Could not install the Python "cryptography" package. Check the internet connection, or run: python -m pip install cryptography' }
+}
+
 # ---- files -------------------------------------------------------------------
 $src = $PSScriptRoot
 # Upgrading: stop the running dashboard first, otherwise the old code keeps running after the files are replaced.

@@ -12,6 +12,7 @@ Standard library only (Python 3.8+). Run:
 """
 import argparse
 import base64
+import hashlib
 import hmac
 import ipaddress
 import json
@@ -29,8 +30,10 @@ from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from auth import INVITE_TTL, SESSION_MAX, AuthError, AuthManager  # noqa: E402
+from notify import Notifier  # noqa: E402
+from secure import KeyStore  # noqa: E402
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 SESSION_COOKIE = "ng_session"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -250,7 +253,9 @@ class DB:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
         # migrations for databases created by older versions
-        for table, col, ddl in (("hosts", "capabilities", "TEXT DEFAULT '{}'"), ("commands", "undo", "TEXT DEFAULT ''")):
+        self.conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+        for table, col, ddl in (("hosts", "capabilities", "TEXT DEFAULT '{}'"), ("commands", "undo", "TEXT DEFAULT ''"),
+                                ("hosts", "token_hash", "TEXT DEFAULT ''"), ("hosts", "token_pending", "TEXT DEFAULT ''")):
             cols = [r[1] for r in self.conn.execute("PRAGMA table_info(%s)" % table)]
             if col not in cols:
                 self.conn.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, col, ddl))
@@ -292,8 +297,141 @@ def decode_alert(a):
 class NetGuard:
     def __init__(self, cfg, config_path=None):
         self.cfg = cfg
+        self.config_path = config_path
         self.db = DB(cfg["db_path"])
+        self.data_dir = os.path.dirname(os.path.abspath(config_path or cfg["db_path"]))
+        self.keys = KeyStore(self.data_dir)
+        try:
+            with open(os.path.join(self.data_dir, "command-signing.pub"), "w") as f:
+                f.write(self.keys.public_b64)      # installers copy this into agent configs (key pinning)
+        except OSError:
+            pass
         self.auth = AuthManager(self.db, cfg, config_path)
+        self.notifier = Notifier(self)
+
+    # ---- settings (key/value, JSON) ----------------------------------------
+    def get_setting(self, key, default=None):
+        row = self.db.one("SELECT value FROM settings WHERE key=?", (key,))
+        return json.loads(row["value"]) if row else default
+
+    def set_setting(self, key, value):
+        self.db.x("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                  (key, json.dumps(value)))
+
+    # ---- agent identity: shared join token -> per-server key ----------------
+    def agent_auth(self, host, token):
+        """Returns (ok, error, issue_new_key)."""
+        token = token or ""
+        th = hashlib.sha256(token.encode()).hexdigest()
+        row = self.db.one("SELECT token_hash, token_pending FROM hosts WHERE name=?", (host,))
+        if row and row["token_hash"]:
+            if hmac.compare_digest(th, row["token_hash"]):
+                return True, None, False
+            return False, ("%s has its own agent key; the shared join token is no longer accepted for it. "
+                           "If the agent lost its key, an owner can reset it in Settings." % host), False
+        if row and row["token_pending"] and hmac.compare_digest(th, row["token_pending"]):
+            self.db.x("UPDATE hosts SET token_hash=token_pending, token_pending='' WHERE name=?", (host,))
+            self.db.audit("agent", "agent_key_activated", "server now uses its own key", host=host)
+            return True, None, False
+        if hmac.compare_digest(token, self.cfg["agent_token"]):
+            if not row and not self.get_setting("allow_enrollment", True):
+                return False, "New servers are not being accepted (turned off in Settings).", False
+            return True, None, True
+        return False, "bad agent token", False
+
+    def reset_host_key(self, user, host):
+        if not self.db.one("SELECT name FROM hosts WHERE name=?", (host,)):
+            raise LookupError("host not found")
+        self.db.x("UPDATE hosts SET token_hash='', token_pending='' WHERE name=?", (host,))
+        self.db.audit(user, "agent_key_reset", "server must re-join with the join token", host=host)
+
+    def remove_host(self, user, host):
+        if not self.db.one("SELECT name FROM hosts WHERE name=?", (host,)):
+            raise LookupError("host not found")
+        self.db.x("UPDATE commands SET status='cancelled' WHERE host=? AND status IN ('pending','sent')", (host,))
+        self.db.x("DELETE FROM hosts WHERE name=?", (host,))
+        self.db.audit(user, "host_removed", "alerts kept for history", host=host)
+
+    def rotate_join_token(self, user):
+        tok = secrets.token_urlsafe(32)
+        if self.config_path:
+            with open(self.config_path, encoding="utf-8") as f:
+                data = json.load(f)
+            data["agent_token"] = tok
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        self.cfg["agent_token"] = tok
+        self.db.audit(user, "join_token_rotated", "servers with their own key are unaffected")
+        return tok
+
+    # ---- dashboard database backups ------------------------------------------
+    def backup_db(self, keep=14):
+        d = os.path.join(self.data_dir, "db-backups")
+        os.makedirs(d, exist_ok=True)
+        dest = os.path.join(d, time.strftime("netguard-%Y%m%d-%H%M%S.db"))
+        src = sqlite3.connect(self.cfg["db_path"])
+        dst = sqlite3.connect(dest)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+        files = sorted(f for f in os.listdir(d) if f.startswith("netguard-") and f.endswith(".db"))
+        for old in files[:-keep]:
+            try:
+                os.remove(os.path.join(d, old))
+            except OSError:
+                pass
+        self.set_setting("last_db_backup", time.time())
+        return dest
+
+    def db_backups(self):
+        d = os.path.join(self.data_dir, "db-backups")
+        if not os.path.isdir(d):
+            return []
+        return [{"name": f, "size": os.path.getsize(os.path.join(d, f)), "mtime": os.path.getmtime(os.path.join(d, f))}
+                for f in sorted(os.listdir(d), reverse=True) if f.endswith(".db")]
+
+    def maintenance(self):
+        """Background loop: daily DB backup, daily notification summary."""
+        while True:
+            try:
+                if time.time() - (self.get_setting("last_db_backup", 0) or 0) > 86400:
+                    self.backup_db()
+                hour = int(self.get_setting("digest_hour", 8))
+                today = time.strftime("%Y-%m-%d")
+                if time.localtime().tm_hour >= hour and self.get_setting("last_digest", "") != today:
+                    self.set_setting("last_digest", today)
+                    self.notifier.send_digest()
+            except Exception as e:
+                print("[maintenance] %s" % e, file=sys.stderr)
+            time.sleep(60)
+
+    def settings_view(self):
+        return {"allow_enrollment": self.get_setting("allow_enrollment", True),
+                "digest_hour": int(self.get_setting("digest_hour", 8)),
+                "dashboard_url": self.get_setting("dashboard_url", "") or self.cfg.get("remote_url", ""),
+                "command_key": self.keys.public_b64,
+                "command_key_fingerprint": hashlib.sha256(self.keys.public_raw).hexdigest()[:16],
+                "data_dir": self.data_dir,
+                "db_backups": self.db_backups()[:14],
+                "hosts": [{"name": h["name"], "has_key": bool(h["token_hash"]), "pending": bool(h["token_pending"]),
+                           "last_seen": h["last_seen"]} for h in self.db.q("SELECT name, token_hash, token_pending, last_seen FROM hosts ORDER BY name")]}
+
+    def save_settings(self, user, body):
+        if "allow_enrollment" in body:
+            self.set_setting("allow_enrollment", bool(body["allow_enrollment"]))
+        if "digest_hour" in body:
+            h = int(body["digest_hour"])
+            if not 0 <= h <= 23:
+                raise ValueError("digest hour must be 0-23")
+            self.set_setting("digest_hour", h)
+        if "dashboard_url" in body:
+            u = str(body["dashboard_url"] or "").strip().rstrip("/")
+            if u and not re.match(r"^https?://[A-Za-z0-9.\-]+(:\d+)?$", u):
+                raise ValueError("dashboard link must look like https://name.example or http://127.0.0.1:8787")
+            self.set_setting("dashboard_url", u)
+        self.db.audit(user, "settings_saved", json.dumps(body)[:300])
 
     # ---- suppression -----------------------------------------------------
     def is_suppressed(self, host, rule, fingerprint):
@@ -307,7 +445,7 @@ class NetGuard:
         return row is not None
 
     # ---- agent ingest ----------------------------------------------------
-    def ingest(self, report):
+    def ingest(self, report, issue_key=False):
         now = time.time()
         host = _valid_name(report.get("host", ""))
         existing = self.db.one("SELECT name FROM hosts WHERE name=?", (host,))
@@ -351,8 +489,20 @@ class NetGuard:
                          (host,))
         for c in cmds:
             c["params"] = json.loads(c["params"] or "{}")
+            # every command is signed; agents verify against the pinned public key and refuse anything else
+            c["envelope"], c["sig"] = self.keys.sign_command(c["id"], host, c["action"], c["params"])
             self.db.x("UPDATE commands SET status='sent', sent_at=? WHERE id=?", (now, c["id"]))
-        return {"ok": True, "new_alerts": new_count, "commands": cmds, "server_time": now}
+        resp = {"ok": True, "new_alerts": new_count, "commands": cmds, "server_time": now,
+                "command_public_key": self.keys.public_b64}
+        if issue_key:
+            tok = secrets.token_urlsafe(32)
+            self.db.x("UPDATE hosts SET token_pending=? WHERE name=?", (hashlib.sha256(tok.encode()).hexdigest(), host))
+            resp["agent_token"] = tok
+            self.db.audit("agent", "agent_key_issued", "server joined with the join token; own key issued", host=host)
+        extra = getattr(self, "ingest_extra", None)
+        if extra:
+            resp.update(extra(host, report) or {})
+        return resp
 
     def _upsert_alert(self, host, a, now):
         rule = _valid_name(a.get("rule", "unknown"))
@@ -383,10 +533,12 @@ class NetGuard:
                          evidence=?, suggested=?, updated_at=? WHERE id=?""",
                       (now, sev, title, details, evidence, suggested, now, cur["id"]))
             return False
-        self.db.x("""INSERT INTO alerts(host,rule,fingerprint,severity,title,details,evidence,suggested,
+        aid = self.db.x("""INSERT INTO alerts(host,rule,fingerprint,severity,title,details,evidence,suggested,
                      status,count,first_seen,last_seen,updated_at)
                      VALUES(?,?,?,?,?,?,?,?,'open',1,?,?,?)""",
-                  (host, rule, fp, sev, title, details, evidence, suggested, now, now, now))
+                        (host, rule, fp, sev, title, details, evidence, suggested, now, now, now))
+        if getattr(self, "notifier", None):
+            self.notifier.alert_created(aid)
         return True
 
     def command_result(self, host, body):
@@ -813,6 +965,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {k: v["label"] for k, v in ACTIONS.items()})
             if path == "/api/sessions":
                 return self._send(200, self.app.auth.sessions(user))
+            if path in ("/api/settings", "/api/notify/channels"):
+                if not AuthManager.can(user, "owner"):
+                    return self._send(403, {"error": "Only owners can see settings."})
+                return self._send(200, self.app.settings_view() if path == "/api/settings" else self.app.notifier.list())
             if path == "/api/users":
                 if not AuthManager.can(user, "owner"):
                     return self._send(403, {"error": "Only owners can manage people."})
@@ -827,11 +983,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             # ---- agent endpoints ----
             if path.startswith("/api/agent/"):
-                if not self._agent():
-                    return self._send(401, {"error": "bad agent token"})
                 body = self._body()
+                host = _valid_name(body.get("host", ""))
+                ok, err, issue = self.app.agent_auth(host, self.headers.get("X-Agent-Token", ""))
+                if not ok:
+                    return self._send(401, {"error": err})
                 if path == "/api/agent/report":
-                    return self._send(200, self.app.ingest(body))
+                    return self._send(200, self.app.ingest(body, issue_key=issue))
                 if path == "/api/agent/command_result":
                     return self._send(200, self.app.command_result(_valid_name(body.get("host", "")), body))
                 return self._send(404, {"error": "not found"})
@@ -859,6 +1017,43 @@ class Handler(BaseHTTPRequestHandler):
             if m:
                 auth.revoke_session(user, int(m.group(1)))
                 return self._send(200, {"ok": True})
+
+            # settings, notifications, agent keys: owners only
+            if path.startswith("/api/settings") or path.startswith("/api/notify") or \
+                    re.match(r"^/api/hosts/[A-Za-z0-9_.\-]+/(reset-key|remove)$", path):
+                if not is_owner:
+                    return self._send(403, {"error": "Only owners can change settings."})
+                if path == "/api/settings":
+                    self.app.save_settings(name, body)
+                    return self._send(200, self.app.settings_view())
+                if path == "/api/settings/join-token":
+                    self.app.db.audit(name, "join_token_viewed", "")
+                    return self._send(200, {"token": self.app.cfg["agent_token"]})
+                if path == "/api/settings/rotate-join-token":
+                    return self._send(200, {"token": self.app.rotate_join_token(name)})
+                if path == "/api/settings/backup-db":
+                    dest = self.app.backup_db()
+                    self.app.db.audit(name, "db_backup", dest)
+                    return self._send(200, {"ok": True, "path": dest})
+                if path == "/api/settings/digest-now":
+                    self.app.notifier.send_digest()
+                    return self._send(200, {"ok": True})
+                m = re.match(r"^/api/hosts/([A-Za-z0-9_.\-]+)/(reset-key|remove)$", path)
+                if m:
+                    (self.app.reset_host_key if m.group(2) == "reset-key" else self.app.remove_host)(name, m.group(1))
+                    return self._send(200, {"ok": True})
+                if path == "/api/notify/channels":
+                    return self._send(200, {"id": self.app.notifier.save(name, body)})
+                m = re.match(r"^/api/notify/channels/(\d+)/(update|delete|test)$", path)
+                if m:
+                    cid, op = int(m.group(1)), m.group(2)
+                    if op == "update":
+                        return self._send(200, {"id": self.app.notifier.save(name, body, cid)})
+                    if op == "delete":
+                        self.app.notifier.delete(name, cid)
+                        return self._send(200, {"ok": True})
+                    return self._send(200, self.app.notifier.test(cid))
+                return self._send(404, {"error": "not found"})
 
             # people management: owners only
             if path.startswith("/api/users"):
@@ -985,6 +1180,7 @@ def main():
     app = NetGuard(cfg, args.config)
     Handler.app = app
     threading.Thread(target=app.watchdog, daemon=True).start()
+    threading.Thread(target=app.maintenance, daemon=True).start()
 
     httpd = ThreadingHTTPServer((cfg["listen_host"], int(cfg["listen_port"])), Handler)
     scheme = "http"
