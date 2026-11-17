@@ -1,0 +1,20 @@
+# systemd unit for running the dashboard on a Linux box.
+#   sudo cp -r dashboard /opt/netguard-dashboard
+#   sudo cp netguard-dashboard.service /etc/systemd/system/ && sudo systemctl enable --now netguard-dashboard
+[Unit]
+Description=NetGuard dashboard
+After=network-online.target
+
+[Service]
+User=netguard
+WorkingDirectory=/opt/netguard-dashboard
+ExecStart=/usr/bin/python3 /opt/netguard-dashboard/server.py --config /opt/netguard-dashboard/config.json
+Restart=always
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/netguard-dashboard
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,6 @@
+dashboard/config.json
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+lab/.labdata/

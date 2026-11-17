@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NetGuard</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M12 2 4 5v6c0 5 3.4 9.7 8 11 4.6-1.3 8-6 8-11V5l-8-3Zm0 2.2 6 2.2V11c0 3.9-2.5 7.6-6 8.8-3.5-1.2-6-4.9-6-8.8V6.4l6-2.2Z"/></svg>
+    <span>NetGuard</span>
+  </div>
+  <nav class="tabs" role="tablist">
+    <button data-tab="alerts" class="active">Alerts <span id="badge-alerts" class="pill"></span></button>
+    <button data-tab="hosts">Hosts</button>
+    <button data-tab="commands">Actions <span id="badge-cmds" class="pill muted"></span></button>
+    <button data-tab="suppressions">Suppressions</button>
+    <button data-tab="audit">Audit log</button>
+    <button data-tab="people" id="tab-btn-people" hidden>People</button>
+  </nav>
+  <div class="top-right">
+    <label class="auto"><input type="checkbox" id="autorefresh" checked> Live</label>
+    <span id="updated" class="muted small"></span>
+    <div class="usermenu" id="usermenu">
+      <button id="usermenu-btn" aria-haspopup="true"><span id="me-name">…</span> <span id="me-role" class="role"></span></button>
+      <div class="menu" id="usermenu-list" hidden>
+        <div class="who" id="me-who"></div>
+        <button data-menu="password">Change password</button>
+        <button data-menu="devices">My signed-in devices</button>
+        <button data-menu="logout">Sign out</button>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main>
+  <!-- summary -->
+  <section class="tiles" id="tiles">
+    <div class="tile sev-critical" data-filter="critical"><div class="n" id="t-critical">–</div><div class="l">Critical</div></div>
+    <div class="tile sev-high" data-filter="high"><div class="n" id="t-high">–</div><div class="l">High</div></div>
+    <div class="tile sev-medium" data-filter="medium"><div class="n" id="t-medium">–</div><div class="l">Medium</div></div>
+    <div class="tile sev-low" data-filter="low"><div class="n" id="t-low">–</div><div class="l">Low / info</div></div>
+    <div class="tile"><div class="n" id="t-hosts">–</div><div class="l">Hosts online</div></div>
+    <div class="tile wide">
+      <div class="l">New alerts, last 24h</div>
+      <svg id="spark" viewBox="0 0 240 40" preserveAspectRatio="none"></svg>
+    </div>
+  </section>
+
+  <!-- alerts -->
+  <section class="panel" id="tab-alerts">
+    <div class="toolbar">
+      <select id="f-status">
+        <option value="active">Active (open + ack)</option>
+        <option value="open">Open</option>
+        <option value="acknowledged">Acknowledged</option>
+        <option value="resolved">Resolved</option>
+        <option value="suppressed">Suppressed</option>
+        <option value="all">All</option>
+      </select>
+      <select id="f-severity">
+        <option value="">Any severity</option>
+        <option>critical</option><option>high</option><option>medium</option><option>low</option><option>info</option>
+      </select>
+      <select id="f-host"><option value="">All hosts</option></select>
+      <input id="f-q" type="search" placeholder="Search title, IP, process…">
+      <div class="spacer"></div>
+      <div class="bulk" id="bulk" hidden>
+        <span id="bulk-n"></span>
+        <button class="btn" data-bulk="acknowledged">Acknowledge</button>
+        <button class="btn" data-bulk="resolved">Resolve</button>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table class="grid" id="alerts-table">
+        <thead><tr>
+          <th class="cb"><input type="checkbox" id="cb-all" aria-label="Select all"></th>
+          <th>Severity</th><th>Alert</th><th>Host</th><th>Status</th><th class="num">Seen</th><th>Last seen</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="empty" id="alerts-empty" hidden>No alerts match. 🎉</div>
+    </div>
+  </section>
+
+  <section class="panel" id="tab-hosts" hidden>
+    <div class="host-grid" id="host-grid"></div>
+  </section>
+
+  <section class="panel" id="tab-commands" hidden>
+    <div class="table-wrap">
+      <table class="grid" id="cmd-table">
+        <thead><tr><th>#</th><th>Host</th><th>Action</th><th>Params</th><th>Status</th><th>By</th><th>Queued</th><th>Output</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel" id="tab-suppressions" hidden>
+    <p class="muted">Suppressed alerts are dropped on arrival. Delete a rule to start receiving those alerts again.</p>
+    <div class="table-wrap">
+      <table class="grid" id="sup-table">
+        <thead><tr><th>#</th><th>Rule</th><th>Host</th><th>Fingerprint</th><th>Reason</th><th>By</th><th>Expires</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel" id="tab-people" hidden>
+    <div class="people-head">
+      <div><b>People</b> <span class="muted small">Each person signs in with their own password and 2-factor code. Owners manage people; admins act on alerts; viewers can only look.</span></div>
+      <button class="btn primary" id="invite-btn">Invite someone</button>
+    </div>
+    <div class="table-wrap">
+      <table class="grid" id="people-table">
+        <thead><tr><th>Name</th><th>Role</th><th>Servers</th><th>2-factor</th><th>Last sign-in</th><th>Status</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <h3 style="margin-top:22px">Signed-in devices</h3>
+    <div class="table-wrap">
+      <table class="grid" id="sessions-table">
+        <thead><tr><th>Person</th><th>Device</th><th>From</th><th>Signed in</th><th>Last active</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel" id="tab-audit" hidden>
+    <div class="table-wrap">
+      <table class="grid" id="audit-table">
+        <thead><tr><th>Time</th><th>User</th><th>Host</th><th>Alert</th><th>Action</th><th>Detail</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<!-- alert drawer -->
+<aside class="drawer" id="drawer" hidden aria-modal="true" role="dialog">
+  <div class="drawer-inner">
+    <button class="x" id="drawer-close" aria-label="Close">×</button>
+    <div id="drawer-body"></div>
+  </div>
+</aside>
+<div class="scrim" id="scrim" hidden></div>
+
+<!-- confirm dialog -->
+<dialog id="confirm">
+  <form method="dialog">
+    <h3 id="confirm-title"></h3>
+    <p id="confirm-text"></p>
+    <div id="confirm-extra"></div>
+    <label class="note">Note (saved in audit log)<textarea id="confirm-note" rows="2"></textarea></label>
+    <div class="row-end">
+      <button value="cancel" class="btn">Cancel</button>
+      <button value="ok" class="btn primary" id="confirm-ok">Confirm</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="toast" class="toast" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
