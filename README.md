@@ -2,6 +2,8 @@
 
 These scripts harden and monitor Linux and Windows servers. A web dashboard shows the alerts, explains each one and lets you decide what to do: resolve it, suppress it as a false positive, or run a fix on the server.
 
+> **New here? Start with [GETTING-STARTED.md](GETTING-STARTED.md):** step-by-step guides to installing, accepting an invite, inviting others, the first-day checklist, everyday use and what to do if you're locked out.
+
 ```
              ┌────────────── dashboard (server.py, port 8787) ──────────────┐
              │  alerts · playbooks · approve fixes · suppress · audit log   │
